@@ -1,9 +1,8 @@
-#include "Shader.h"
+#include "Scene_7.h"
 #include <gl\glfw3.h>
 #include <glm\glm.hpp>
 #include <time.h>
 #include <iostream>
-#include "Shader.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
@@ -15,7 +14,7 @@
 //#include "Scene_3_Moving_Camera_Blur_funny_Error.h"
 //#include "Scene_4_Moving_Correct.h"
 //#include "Scene_6_Moving_Camera_Full_Intergration.h"
-#include "Scene_7.h"
+
 
 
 float moveSpeed = 2.5f;
@@ -39,9 +38,8 @@ RenderOptions renderOptions;
 Scene scn;
 
 string shader_direction = "D:/a_gpu_path_tracing/4.GLSL_Final/GLSL_Final_Version/";
-//string scene_direction = "D:/a_gpu_path_tracing/2._Robert_beckanb/OpenGL-PathTracer-master/assets/";//"D:/a_gpu_path_tracing/assets/";
-string scene_direction = "E:\\Models\\Cornell_Box\\cornell-box.obj";  //cornell_box_correct.obj";
-//string scene_direction = "E:\\Models\\fireplace_room\\FireRoom\\fireplace_room.obj";
+string scene_direction = "E:\\Models\\Cornell_Box\\cornell-box.obj";  
+
 void init_scene(int index)
 {
 	string sceneFilenames[] =
@@ -236,16 +234,6 @@ void main()
 	int currentSceneIndex = 0;
 
 	init_scene(currentSceneIndex);
-
-	//quad = new Quad();
-
-
-
-
-	//set_up_camera(scn.path_trace_shader);
-
-	//init_scene();
-
 	//end set up
 
 	double lastTime = glfwGetTime();
