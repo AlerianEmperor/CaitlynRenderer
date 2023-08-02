@@ -9,4 +9,4 @@ Lamp: 620074 triangles.
 
 Add Texture:
 
-![Added_Texture](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/236ef271-7e11-460c-a0fa-7f1e648f1b55)
+![Added_Texture_2](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/1038835c-b3ab-469b-bca5-903213dd4fc5)
