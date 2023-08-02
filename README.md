@@ -7,6 +7,6 @@ Cornel Box: 36 triangles.
 Lamp: 620074 triangles.
 ![Pixar_Lamp_2](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/6d9babbb-0a17-4af8-ada4-f547f43cbf94)
 
-
 Add Texture:
+
 ![Added_Texture](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/236ef271-7e11-460c-a0fa-7f1e648f1b55)
