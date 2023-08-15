@@ -1,4 +1,4 @@
-# GLSL-PathTracer
+# Caitlyn Renderer
 GLSL Real Time Path Tracer!
 
 Cornel Box: 36 triangles.
