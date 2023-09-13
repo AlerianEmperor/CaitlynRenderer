@@ -11,3 +11,10 @@ Lamp: 620074 triangles.
 Add Texture: 
 
 ![Added_Texture_2](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/1038835c-b3ab-469b-bca5-903213dd4fc5)
+
+SBVH + Optimize BVH
+
+Optimize BVH: 1.9fps -> 2.1fps
+
+SBVH: 2.1fps -> 2.4fps
+![sbvh_2 4_fps](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/c07a4d08-8c92-4848-ab0b-7ed843c16428)
