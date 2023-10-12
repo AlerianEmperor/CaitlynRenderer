@@ -1,20 +1,19 @@
 # Caitlyn Renderer
-GLSL Real Time Path Tracer!
+A Real Time Path Tracer in GLSL.
 
-Cornel Box: 36 triangles.
-![Caitlyn_Bikini_2](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/614701e0-782f-4141-be2f-2fa59575bd0b)
+![rank3police](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/aa5cb991-f7e8-4580-9e90-1ef116486bd6)
 
-Lamp: 620074 triangles.
-![Pixar_Lamp_2](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/6d9babbb-0a17-4af8-ada4-f547f43cbf94)
+![DiningRoom](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/6992d4d8-f3e8-49da-92aa-c0be57f0d19b)
 
+![hyper_scene](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/0ef1624d-165a-44b2-be6f-77baa5d1dccb)
 
-Add Texture: 
+![cornell_1024](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/1ea20cf0-bf2e-4183-892b-db22f9304be7)
 
-![Added_Texture_2](https://github.com/AlerianEmperor/Caitlyn/assets/93391908/1038835c-b3ab-469b-bca5-903213dd4fc5)
-
-SBVH + Optimize BVH
-
-Optimize BVH: 1.9fps -> 2.1fps
-
-SBVH: 2.1fps -> 2.4fps
-![sbvh_2 4_fps](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/c07a4d08-8c92-4848-ab0b-7ed843c16428)
+# Features
+- Real time path tracing.
+- Unidirectional Path Tracing.
+- SAH BVH.
+- SBVH (Spatial Split BVH).
+- CWBVH (Compressed Wide BVH), which run 2 to 4 times faster than SBVH.
+- Disney BSDF.
+- Interactive control and update scene setting using GUI.
