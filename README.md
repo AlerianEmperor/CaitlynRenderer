@@ -5,7 +5,7 @@ A Real Time Path Tracer in GLSL.
 
 ![DiningRoom](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/6992d4d8-f3e8-49da-92aa-c0be57f0d19b)
 
-![hyper_scene](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/0ef1624d-165a-44b2-be6f-77baa5d1dccb)
+![iron](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/dbf68cb0-7664-4114-be96-e84a4a20db7f)
 
 ![cornell_1024](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/1ea20cf0-bf2e-4183-892b-db22f9304be7)
 
