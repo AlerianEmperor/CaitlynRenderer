@@ -13,7 +13,7 @@ A Real Time Path Tracer in GLSL.
 - Real time path tracing.
 - Unidirectional Path Tracing.
 - SAH BVH.
-- SBVH (Spatial Split BVH).
+- SBVH (Spatial Split BVH), which run 20% - 30% faster than SAH BVH.
 - CWBVH (Compressed Wide BVH), which run 2 to 4 times faster than SBVH.
 - Disney BSDF.
 - Interactive control and update scene setting using GUI.
