@@ -9,6 +9,8 @@ A Real Time Path Tracer in GLSL.
 
 ![cwbvh_1024](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/f0617806-9d95-4353-9f7c-41e94c25aec8)
 
+These images were rendered by my 10 years old laptop, if I have a new laptop or GPU, the performance will be much higher!
+
 # Features
 - Real time path tracing.
 - Unidirectional Path Tracing.
