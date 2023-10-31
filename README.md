@@ -7,7 +7,7 @@ A Real Time Path Tracer in GLSL.
 
 ![iron](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/dbf68cb0-7664-4114-be96-e84a4a20db7f)
 
-![cornell_1024_2](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/e3afc9ed-0783-4b12-8938-9f72521f61ab)
+![cwbvh_1024](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/f0617806-9d95-4353-9f7c-41e94c25aec8)
 
 # Features
 - Real time path tracing.
