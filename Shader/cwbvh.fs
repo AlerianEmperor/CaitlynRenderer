@@ -371,34 +371,7 @@ uint sign_extend_s8x4(uint x)
 	return ((x >> 7) & 0x01010101) * 0xff;
 }
 
-#define BVH_STACK_SIZE 32
-#define SHARED_STACK_SIZE 8
-#define LOCAL_STACK_SIZE (BVH_STACK_SIZE - SHARED_STACK_SIZE)
-
-#define SHARED_STACK_INDEX(offset) ((gl_LocalInvocationID.y * SHARED_STACK_SIZE + offset) * 32 + gl_LocalInvocationID.x)
-
-const int shared_size = SHARED_STACK_SIZE * 64;
-
-uvec2 shared_stack_bvh8[shared_size];
-
-void stack_push(inout uvec2 stack[LOCAL_STACK_SIZE], inout int stack_size, in uvec2 item)
-{
-	if(stack_size < SHARED_STACK_SIZE)
-		shared_stack_bvh8[SHARED_STACK_INDEX(stack_size)] = item;
-	else
-		stack[stack_size - SHARED_STACK_SIZE] = item;
-	++stack_size;
-}
-
-uvec2 stack_pop(in uvec2 stack[LOCAL_STACK_SIZE], inout int stack_size)
-{
-	--stack_size;
-
-	if(stack_size < SHARED_STACK_SIZE)
-		return shared_stack_bvh8[SHARED_STACK_INDEX(stack_size)];
-	else
-		return stack[stack_size - SHARED_STACK_SIZE];
-}
+#define LOCAL_STACK_SIZE 16
 
 uint bvh8_node_intersect(in Ray r, vec3 inv_direction, uint oct_inv4, float max_t, BVH8node node)
 {
@@ -499,7 +472,7 @@ bool hit_bvh8(in Ray r, inout HitRecord rec)
 			current_group.y &= ~(1 << child_index_offset);
 
 			if((current_group.y & 0xff000000) != 0)
-				stack_push(local_stack, stack_size, current_group);
+				local_stack[stack_size++] = current_group;
 
 			uint slot_index = (child_index_offset - 24) ^ (oct_inv4 & 0xff);
 			uint relative_index = bitCount(hits_imask & ~(0xffffffff << slot_index));
@@ -548,7 +521,7 @@ bool hit_bvh8(in Ray r, inout HitRecord rec)
 		{
 			if(stack_size == 0)
 				break;
-			current_group = stack_pop(local_stack, stack_size);
+			current_group = local_stack[stack_size--];
 		}
 	}
 	if(max_t < inf)
@@ -587,7 +560,7 @@ bool hit_bvh8_shadow(in Ray r, float max_t)
 			current_group.y &= ~(1 << child_index_offset);
 
 			if((current_group.y & 0xff000000) != 0)
-				stack_push(local_stack, stack_size, current_group);
+				local_stack[stack_size++] = current_group;
 
 			uint slot_index = (child_index_offset - 24) ^ (oct_inv4 & 0xff);
 			uint relative_index = bitCount(hits_imask & ~(0xffffffff << slot_index));
@@ -635,7 +608,7 @@ bool hit_bvh8_shadow(in Ray r, float max_t)
 		{
 			if(stack_size == 0)
 				break;
-			current_group = stack_pop(local_stack, stack_size);
+			current_group = local_stack[stack_size--];
 		}
 	}
 
