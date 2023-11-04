@@ -11,6 +11,9 @@ A Real Time Path Tracer in GLSL.
 
 These images were rendered by my 10 years old laptop, if I have a new laptop or GPU, the performance will be much higher!
 
+# Control
+W, A, S, D to move, left mouse to navigate, right mouse to adjust UI.
+
 # Features
 - Real time path tracing.
 - Unidirectional Path Tracing.
