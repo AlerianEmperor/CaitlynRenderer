@@ -22,3 +22,9 @@ W, A, S, D to move, left mouse to navigate, right mouse to adjust UI.
 - CWBVH (Compressed Wide BVH), which run 2 to 4 times faster than SBVH.
 - Disney BSDF.
 - Interactive control and update scene setting using GUI.
+
+<img width="1810" height="1013" alt="caitlyn renderer" src="https://github.com/user-attachments/assets/22e9a6a1-4b90-4c75-88e2-72d6e33abd95" />
+
+It's weird that Cailtyn Renderer has more than 2k clones in the past 2 years, but only 2 stars so far (one of them belong to me, obviously), despite being much easier to read than many real-time path tracer out there. But whatever, that's ok. Apparently, I haven't upload anything for a while, it's not because I am lazy or not doing anything. But I have a habit of uploading a complete project and a huge chunk of code when I finish everything, that's why you won't see anything until it happened, just like a lightning. 
+
+Currently I am doing stuff that is way better than what I have on github, maybe I will upload it soon, so cheers.
