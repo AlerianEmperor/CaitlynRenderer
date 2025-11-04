@@ -1338,13 +1338,18 @@ vec3 path_trace(inout Ray r)
 				{
 					vec3 light_direction = r.d * rec.t;
 
-					float length = length(light_direction);
+					//float length = length(light_direction);
 
-					light_direction = normalize(light_direction);
+					//light_direction = normalize(light_direction);
+					float length2 = dot(light_direction, light_direction);
+
+					float ilength = inversesqrt(length2);
+
+					float length = length2 * ilength;
 
 					float cos_light = (-dot(light_direction, rec.n));//ko can abs
 
-					float length2 = length * length;
+					//float length2 = length * length;
 
 					int light_index = int(emission.w);//int(vt.w);
 
@@ -1385,9 +1390,15 @@ vec3 path_trace(inout Ray r)
 
 				vec3 light_direction = light_position - hit_point;
 
-				float length = length(light_direction);
+				//float length = length(light_direction);
 
-				float ilength = 1.0f / length;
+				//float ilength = 1.0f / length;
+
+				float length2 = dot(light_direction, light_direction);
+
+				float ilength = inversesqrt(length2);
+
+				float length = length2 * ilength;
 
 				light_direction *= ilength;
 
@@ -1433,7 +1444,7 @@ vec3 path_trace(inout Ray r)
 
 					//float length2 = length * length;
 
-					float pdf_light = (length * length) / (light_area_pdf.x * -cos_light) * light_area_pdf.y;
+					float pdf_light = (length2) / (light_area_pdf.x * -cos_light) * light_area_pdf.y;
 
 					vec3 bsdf_eval = diffuse_bsdf(r, rec, light_direction);
 
@@ -1520,6 +1531,7 @@ void main()
 
 	color = pixelColor + accumulate_color;
 }
+
 
 
 
