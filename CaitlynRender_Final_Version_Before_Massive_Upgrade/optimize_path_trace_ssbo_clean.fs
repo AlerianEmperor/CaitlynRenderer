@@ -128,10 +128,10 @@ float rnd(inout uint state) {
 
 float rand()
 {
-	seed -= vec2(randomVector.x * randomVector.y);
+	seed += randomVector;//vec2(randomVector.x, randomVector.y);
 
 	//uint state = 
-	uint state = floatBitsToUint(seed.x * 1234567.0 + seed.y * 7654321.0);
+	//uint state = floatBitsToUint(seed.x * 1234567.0 + seed.y * 7654321.0);
 	//state = state * 747796405u + 2891336453u;
 	//return float(state) * (1.0/4294967296.0);
 
@@ -1513,5 +1513,6 @@ void main()
 
 	color = pixelColor + accumulate_color;
 }
+
 
 
