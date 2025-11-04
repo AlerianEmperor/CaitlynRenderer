@@ -1450,6 +1450,13 @@ vec3 path_trace(inout Ray r)
 					
 				}
 			}
+			//Russian Roulette
+			if (i >= 1)
+			{
+				float p = max(T.x, max(T.y, T.z));
+				if (rand2() > p) break;
+				T *= 1.0 / p;
+			}
 
 			//Sample for new ray
 			vec3 sample_direction = diffuse_sample(r, rec.n);
@@ -1513,6 +1520,7 @@ void main()
 
 	color = pixelColor + accumulate_color;
 }
+
 
 
 
