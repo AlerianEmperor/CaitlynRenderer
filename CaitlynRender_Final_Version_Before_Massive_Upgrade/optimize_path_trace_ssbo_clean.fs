@@ -1494,6 +1494,235 @@ vec3 path_trace(inout Ray r)
 	return L;
 }
 
+//good! fast! but result not really correct 
+vec3 path_trace_optimize_2(inout Ray r)
+{
+    vec3 L = vec3(0.0);
+    vec3 T = vec3(1.0);
+
+    bool specularBounce = true;
+
+    for (int bounce = 0; bounce < 3; bounce++)
+    {
+        HitRecord rec;
+        if (!trace_bvh(r, rec))
+            break;
+
+        float tHit = rec.t;
+        vec3 n = rec.n;
+        float ndotd = dot(r.d, n);
+        if (ndotd > 0.0) n = -n;
+
+        // emission
+        if (rec.emission.w != -1.0)   // light
+        {
+            if (specularBounce)
+                L += T * rec.emission.xyz;
+            else
+                L += T * rec.emission.xyz; // no MIS - Cornell box is fine
+            break;
+        }
+
+        vec3 hitPoint = r.o + r.d * tHit + n * 0.0002;
+
+        // Direct light sample (1 light ? no MIS needed)
+        {
+            int li = int(rand2() * numLights);
+            Light4 Ld = lights[li];
+
+            vec3 lp = sample_light_position(li);
+            vec3 ldir = lp - hitPoint;
+            float dist = length(ldir);
+            ldir *= 1.0 / dist;
+
+            float cos1 = dot(ldir, n);
+            float cos2 = dot(ldir, Ld.n.xyz); // light normal
+
+            if (cos1 > 0.0 && cos2 < 0.0 && !hit_shadow(Ray(hitPoint, ldir), dist - 0.001))
+            {
+                float invpdf = (dist * dist) / (Ld.area_pdf.x * -cos2) * Ld.area_pdf.y;
+                L += T * Ld.e.xyz * cos1 / max(invpdf, 1e-6);
+            }
+        }
+
+        // BSDF diffuse sample
+        vec3 u = diffuse_sample(n);//cosine_sample_hemisphere(n);
+
+		 //vec3 bsdf_eval_sample = rec.albedo.xyz;
+        //float bsdf_pdf = max(dot(sample_dir, rec.n), 0.0) * ipi;
+
+        // update throughput
+       // T *= bsdf_eval_sample;
+
+        float cosOut = dot(u, n);
+        T *= rec.albedo.xyz * cosOut * ipi;
+
+        r.o = hitPoint;
+        r.d = u;
+
+		/*vec3 sample_dir = diffuse_sample(Ray(r.o, r.d), rec.n);
+        // bsdf eval and pdf inline
+        vec3 bsdf_eval_sample = rec.albedo.xyz;
+        float bsdf_pdf = max(dot(sample_dir, rec.n), 0.0) * ipi;
+
+        // update throughput
+        T *= bsdf_eval_sample;
+        //prev_pdf = bsdf_pdf;
+        //is_specular = false;
+		
+
+        // update ray local copies
+        r.o = hitPoint;
+        r.d = sample_dir;*/
+
+        specularBounce = false;
+
+        // Russian roulette after bounce 1
+        if (bounce >= 1)
+        {
+            float p = max(T.x, max(T.y, T.z));
+            if (rand2() > p) break;
+            T *= 1.0 / p;
+        }
+    }
+
+    return L;
+}
+
+//same as path_trace but rewrite so it look cleaner and less verbose
+//path trace_optimize_2 run faster because it produce darker image so russian roulette will terminate the ray quicker
+vec3 path_trace_optimize_2_MIS(inout Ray r)
+{
+    vec3 L = vec3(0.0);
+    vec3 T = vec3(1.0);
+
+	float prev_pdf = 1.0f;
+
+    bool specularBounce = true;
+
+    for (int bounce = 0; bounce < 3; bounce++)
+    {
+        HitRecord rec;
+        if (!trace_bvh(r, rec))
+            break;
+
+        float tHit = rec.t;
+        vec3 n = rec.n;
+        float ndotd = dot(r.d, n);
+        if (ndotd > 0.0) n = -n;
+
+        // emission
+        if (rec.emission.w != -1.0)   // light
+        {
+            if (specularBounce)
+                L += T * rec.emission.xyz;
+            else
+			{
+				vec3 light_direction = r.d * rec.t;
+
+				float length = length(light_direction);
+
+				light_direction = normalize(light_direction);
+
+				float cos_light = (-dot(light_direction, rec.n));//ko can abs
+
+				float length2 = length * length;
+
+				int light_index = int(rec.emission.w);//int(vt.w);
+
+				
+				Light4 l = lights[light_index];
+				vec3 light_area_pdf = l.area_pdf.xyz;
+					
+				float pdf_light = length2 / (light_area_pdf.x * cos_light) * light_area_pdf.y;
+				float mis_weight = power_heuristic(prev_pdf, pdf_light);
+
+				L += T * rec.emission.xyz * mis_weight;
+                //L += T * rec.emission.xyz; // no MIS - Cornell box is fine
+			}
+			return L;
+            //break;
+        }
+
+        vec3 hitPoint = r.o + r.d * tHit + n * 0.0002;
+		vec4 specular = rec.specular;
+
+
+        // Direct light sample (1 light ? no MIS needed)
+		if(specular.w == 0)
+        {
+            int li = int(rand2() * numLights);
+            Light4 Ld = lights[li];
+
+            vec3 lp = sample_light_position(li);
+            vec3 ldir = lp - hitPoint;
+            float dist = length(ldir);
+            ldir *= 1.0 / dist;
+
+            float cos1 = dot(ldir, n);
+            float cos2 = -dot(ldir, Ld.n.xyz); // light normal
+
+            if (cos1 > 0.0 && cos2 > 0.0 && !hit_shadow(Ray(hitPoint, ldir), dist - 0.001))
+            {
+                //float invpdf = (dist * dist) / (Ld.area_pdf.x * -cos2) * Ld.area_pdf.y;
+                //L += T * Ld.e.xyz * cos1 / max(invpdf, 1e-6);
+
+				float pdf_light = (dist * dist * Ld.area_pdf.y) / (Ld.area_pdf.x * cos2);
+
+				vec3 bsdf_eval = diffuse_bsdf(r, rec, ldir);
+
+				float bsdf_pdf = diffuse_pdf(r, rec, ldir);
+
+				float mis_weight = power_heuristic(pdf_light, bsdf_pdf);
+
+				L += T * Ld.e.xyz * bsdf_eval * mis_weight / pdf_light;
+            }
+        }
+
+        // BSDF diffuse sample
+        vec3 u = diffuse_sample(n);//cosine_sample_hemisphere(n);
+
+		 //vec3 bsdf_eval_sample = rec.albedo.xyz;
+        //float bsdf_pdf = max(dot(sample_dir, rec.n), 0.0) * ipi;
+
+        // update throughput
+       // T *= bsdf_eval_sample;
+
+        //float cosOut = dot(u, n);
+        T *= rec.albedo.xyz;// * cosOut * ipi;
+
+        r.o = hitPoint;
+        r.d = u;
+
+		/*vec3 sample_dir = diffuse_sample(Ray(r.o, r.d), rec.n);
+        // bsdf eval and pdf inline
+        vec3 bsdf_eval_sample = rec.albedo.xyz;
+        float bsdf_pdf = max(dot(sample_dir, rec.n), 0.0) * ipi;
+
+        // update throughput
+        T *= bsdf_eval_sample;
+        //prev_pdf = bsdf_pdf;
+        //is_specular = false;
+		
+
+        // update ray local copies
+        r.o = hitPoint;
+        r.d = sample_dir;*/
+
+        specularBounce = false;
+
+        // Russian roulette after bounce 1
+        if (bounce >= 1)
+        {
+            float p = max(T.x, max(T.y, T.z));
+            if (rand2() > p) break;
+            T *= 1.0 / p;
+        }
+    }
+
+    return L;
+}
+
 void main()
 {
 	seed = gl_FragCoord.xy;
@@ -1531,6 +1760,7 @@ void main()
 
 	color = pixelColor + accumulate_color;
 }
+
 
 
 
