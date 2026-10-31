@@ -1,4 +1,4 @@
-<img width="1920" height="1080" alt="11 9 fps" src="https://github.com/user-attachments/assets/4f94f6be-bc10-4895-9c62-e4bca468460b" /># Caitlyn Renderer
+# Caitlyn Renderer
 A Real Time Path Tracer in GLSL.
 
 ![rank3police](https://github.com/AlerianEmperor/CaitlynRenderer/assets/93391908/aa5cb991-f7e8-4580-9e90-1ef116486bd6)
