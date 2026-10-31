@@ -20,7 +20,7 @@ over all Cailtyn is now 3.3 time faster than my old version.
 
 Ray tracing is so boring if you do it for a while, game engine is so much better!
 
-fireroom 144k triangles, 1024 x 720, 3 depth, nee, 11.9 fps, sbvh
+fireroom 144k triangles, 1024 x 720, 3 depth, nee, 11.9 fps, adaptive sampling, RR, sbvh
 
 <img width="1920" height="1080" alt="11 9 fps" src="https://github.com/user-attachments/assets/16b0930c-408d-4599-9310-85f16a87f1da" />
 
