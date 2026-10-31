@@ -12,11 +12,16 @@ A Real Time Path Tracer in GLSL.
 These images were rendered by my 10 years old laptop, if I have a new laptop or GPU, the performance will be much higher!
 
 Final update:
-convert to compute shader, but it is not so much faster than expected, wbvh is a hoax also, may review cwbvh in the future. This will be the last update before realsing my newest game engine.
+convert to compute shader, but it is not so much faster than expected, wbvh is a hoax also, may review cwbvh in the future. 
+
+This will be the last update before realsing my newest game engine.
 
 over all Cailtyn is now 3.3 time faster than my old version.
 
+Ray tracing is so boring if you do it for a while, game engine is so much better!
+
 fireroom 144k triangles, 1024 x 720, 3 depth, nee, 11.9 fps, sbvh
+
 <img width="1920" height="1080" alt="11 9 fps" src="https://github.com/user-attachments/assets/16b0930c-408d-4599-9310-85f16a87f1da" />
 
 # Control
