@@ -16,7 +16,7 @@ converted to compute shader, but it is not so much faster than I expected, wbvh 
 
 This will be the last update before releasing my newest game engine.
 
-over all Cailtyn is now 3.3 time faster than my old version.
+Over all Cailtyn is now 3.3 time faster than my old version.
 
 Ray tracing is so boring if you do it for a while, game engine is so much better!
 
