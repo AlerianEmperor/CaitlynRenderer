@@ -12,7 +12,7 @@ A Real Time Path Tracer in GLSL.
 These images were rendered by my 10 years old laptop, if I have a new laptop or GPU, the performance will be much higher!
 
 Final update:
-converted to compute shader, but it is not so much faster than I expected, wbvh is a hoax also, may review cwbvh in the future. 
+converted to compute shader, but it is not so much faster than I expected, wbvh is a hoax, may review cwbvh in the future. 
 
 This will be the last update before releasing my newest game engine.
 
