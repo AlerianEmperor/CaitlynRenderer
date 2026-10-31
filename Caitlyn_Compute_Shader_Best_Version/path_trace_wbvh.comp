@@ -1,0 +1,1187 @@
+#version 460 core
+
+//best file!!
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uniform int tree_height;
+int bvh_height = tree_height;
+uniform int currentFrameSample;
+
+//#define VARIANCE_THRESHOLD 0.00005f 
+
+//#define MIN_SAMPLES 16
+
+#define VARIANCE_THRESHOLD 0.0002f 
+
+#define MIN_SAMPLES 8
+
+shared bool shared_workgroup_active;
+
+layout(std430, binding = 1) restrict readonly buffer vertices_buf
+{
+    vec4 vertices[];
+};
+
+layout(std430, binding = 2) buffer normals_buf
+{
+    vec4 normals[];
+};
+
+layout(std430, binding = 3) buffer texcoords_buf
+{
+    vec2 texcoords[];
+};
+
+layout(std430, binding = 4) restrict readonly buffer triangles_buf
+{
+    ivec4 triangles[];
+};
+
+layout(std430, binding = 5) buffer mats_buf
+{
+    vec4 materials[];
+};
+
+struct Light4
+{
+    vec4 p;
+    vec4 u;
+    vec4 v;
+    vec4 e;
+    vec4 n;
+    vec4 area_pdf;
+};
+
+layout(std430, binding = 6) buffer light_buf
+{
+    Light4 lights[];
+};
+
+/*layout(std430, binding = 7) readonly buffer bvh_buf
+{
+    vec4 bvh[];
+};*/
+
+struct FlatNode4 {
+    vec4 bmin_x; vec4 bmin_y; vec4 bmin_z;
+    vec4 bmax_x; vec4 bmax_y; vec4 bmax_z;
+    ivec4 child_or_start;
+    ivec4 triangle_count;
+};
+
+layout(std430, binding = 7) readonly buffer BVH4Buffer {
+    FlatNode4 bvh[];
+};
+
+layout(binding = 8) uniform sampler2DArray albedo_textures;
+
+layout(rgba32f, binding = 9) uniform image2D img_output;
+
+layout(binding = 10) uniform sampler2D accumulate_tex;
+
+layout(rgba32f, binding = 11) uniform image2D variance_history_tex;
+
+#define pi 3.1415926
+#define pi2 6.2831853
+#define ipi 1.0f / pi
+
+struct Ray { vec3 o; vec3 d; };
+struct Camera { vec3 up; vec3 right; vec3 forward; vec3 position; float fov; float focalDist; float aperture; };
+
+vec2 seed;
+
+uniform Camera camera;
+uniform vec2 screenResolution;
+uniform vec2 randomVector;
+uniform int numLights;
+
+#define inf 1e9
+#define eps 1e-4f
+
+float rand()
+{
+    seed -= vec2(randomVector.x * randomVector.y);
+    uint state = floatBitsToUint(seed.x * 1234567.0 + seed.y * 7654321.0);
+    return fract(sin(dot(seed, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void onb(in vec3 n, out vec3 b1, out vec3 b2)
+{
+    if (n.z < -0.999f) {
+        b1 = vec3(0, -1, 0);
+        b2 = vec3(-1, 0, 0);
+    } else {
+        float a = 1.0 / (1.0 + n.z);
+        float b = -n.x * n.y * a;
+        b1 = vec3(1.0 + b, b, -n.x);
+        b2 = vec3(b, 1.0 + b, -n.y);
+    }
+}
+
+struct HitRecord
+{
+    vec4 albedo;  
+    vec4 emission;
+    vec4 specular;
+    vec4 tex_ind;
+    vec3 n;
+    vec2 texcoord;
+    float u;
+    float v;
+    float t;
+    int triangle_ind;
+    int mtl_ind;
+};
+
+float power_heuristic(float a, float b)
+{
+    float t = a * a;
+    return t / (b * b + t);
+}
+
+float power_heuristic_divide(float a, float b)
+{
+    return a / (b * b + a * a);
+}
+
+vec3 cosine_hemisphere_sampling()
+{
+    float u1 = rand();
+    float u2 = rand();
+    float r = sqrt(u1);
+    float phi = pi2 * u2;
+    return vec3(r * cos(phi), r * sin(phi), sqrt(1.0f - u1));
+}
+
+vec3 diffuse_sample(in Ray r, vec3 n)
+{
+    vec3 u, v;
+    onb(n, u, v);
+    vec3 dir = cosine_hemisphere_sampling();
+    dir = u * dir.x + v * dir.y + n * dir.z;
+    return dir;
+}
+
+float diffuse_pdf(Ray r, inout HitRecord rec, in vec3 sample_direction)
+{
+    float cos = dot(sample_direction, rec.n);
+    return cos * ipi;
+}
+
+vec3 diffuse_bsdf(Ray r, inout HitRecord rec, in vec3 sample_direction)
+{
+    return rec.albedo.xyz;
+} 
+
+vec2 interpolate(vec2 a, vec2 b, vec2 c, float u, float v) { return a * (1.0f - u - v) + b * u + c * v; }
+vec3 interpolate(vec3 a, vec3 b, vec3 c, float u, float v) { return a * (1.0f - u - v) + b * u + c * v; }
+
+ivec3 get_ray_sign(vec3 invdir) 
+{
+    return ivec3(lessThan(invdir, vec3(0.0)));
+}
+
+vec4 hit_bbox4_parallel(int node_idx, vec3 r_o, vec3 invdir)
+{
+    FlatNode4 node = bvh[node_idx];
+
+    // L?p toán vector hóa: x? lý ??ng th?i 4 tr?c X c?a 4 h?p, t??ng t? Y và Z
+    vec4 tbot_x = (node.bmin_x - r_o.x) * invdir.x;
+    vec4 ttop_x = (node.bmax_x - r_o.x) * invdir.x;
+    vec4 tmin_x = min(tbot_x, ttop_x);
+    vec4 tmax_x = max(tbot_x, ttop_x);
+
+    vec4 tbot_y = (node.bmin_y - r_o.y) * invdir.y;
+    vec4 ttop_y = (node.bmax_y - r_o.y) * invdir.y;
+    vec4 tmin_y = min(tbot_y, ttop_y);
+    vec4 tmax_y = max(tbot_y, ttop_y);
+
+    vec4 tbot_z = (node.bmin_z - r_o.z) * invdir.z;
+    vec4 ttop_z = (node.bmax_z - r_o.z) * invdir.z;
+    vec4 tmin_z = min(tbot_z, ttop_z);
+    vec4 tmax_z = max(tbot_z, ttop_z);
+
+    // Tìm kho?ng giao c?a c? 4 h?p theo chu?n toán h?c không r? nhánh c? c?a b?n
+    vec4 tl = max(tmin_x, max(tmin_y, tmin_z));
+    vec4 th = min(tmax_x, min(tmax_y, tmax_z));
+
+    // T?o m?t n? ki?m tra: 
+    // 1. tl <= th (Tia c?t qua h?p)
+    // 2. th >= 0.0 (H?p n?m phía tr??c tia)
+    // 3. node.triangle_count != -1 (H?p con ?ó t?n t?i, không ph?i slot tr?ng)
+    //bvec4 hit_mask = lessThanEqual(tl, th) && greaterThanEqual(th, vec4(0.0)) && greaterThanEqual(node.triangle_count, ivec4(0));
+
+    // S?a l?i cú pháp logic bvec4 t?i ?ây
+    bvec4 mask1 = lessThanEqual(tl, th);
+    bvec4 mask2 = greaterThanEqual(th, vec4(0.0));
+    bvec4 mask3 = greaterThanEqual(node.triangle_count, ivec4(0));
+
+    bvec4 hit_mask = bvec4(
+        mask1.x && mask2.x && mask3.x,
+        mask1.y && mask2.y && mask3.y,
+        mask1.z && mask2.z && mask3.z,
+        mask1.w && mask2.w && mask3.w
+    );
+
+    
+    // N?u TRÚNG thì gi? nguyên `tl`, n?u TR??T thì gán b?ng giá tr? vô c?c ?? lúc ??y vào Stack nó t? lo?i
+    return mix(vec4(999999.0), tl, hit_mask);
+}
+
+
+
+bool hit_triangle(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = vec3(
+        r.d.y * v2.z - r.d.z * v2.y,
+        r.d.z * v2.x - r.d.x * v2.z,
+        r.d.x * v2.y - r.d.y * v2.x
+    );
+
+    vec3 tv = r.o - v0;
+    vec3 qv = vec3(
+        tv.y * v1.z - tv.z * v1.y,
+        tv.z * v1.x - tv.x * v1.z,
+        tv.x * v1.y - tv.y * v1.x
+    );
+
+    vec4 uvt;
+    uvt.x = dot(tv, pv);
+    uvt.y = dot(r.d, qv);
+    uvt.z = dot(v2, qv);
+    float inv_det = 1.0f / dot(v1, pv);
+
+    uvt.xyz = uvt.xyz * inv_det;
+    uvt.w = 1.0 - uvt.x - uvt.y;
+    
+    if (all(greaterThanEqual(uvt, vec4(0.0f))) && uvt.z < t)
+    {
+        t = uvt.z;
+        rec.u = uvt.x;
+        rec.v = uvt.y;
+        rec.triangle_ind = i;
+        rec.mtl_ind = (triIndex.w);
+        return true;
+    }   
+    return false;
+}
+
+bool hit_triangle2(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = -vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz + v0;
+    vec3 v2 = vertices[triIndex.z].xyz + v0;
+
+    vec3 pv = cross(r.d, v2);
+    float det = dot(v1, pv);
+
+    //front face only
+    // if 2 face use abs(det)
+    if (abs(det) < 1e-6) return false;
+    float inv_det = 1.0f / det;
+
+    vec3 tv = r.o + v0;
+    float u = dot(tv, pv) * inv_det;
+    if (u < 0.0 || u > 1.0 ) return false;
+
+    vec3 qv = cross(tv, v1);
+    float v = dot(r.d, qv) * inv_det;
+    if (v < 0.0 || v > 1.0 || u + v > 1.0) return false;
+
+    float t_hit = dot(v2, qv) * inv_det;
+    
+    if (t_hit > 0.0 && t_hit < t)
+    {
+        t = t_hit;
+        rec.u = u;
+        rec.v = v;
+        rec.triangle_ind = i;
+        rec.mtl_ind = triIndex.w;
+        return true;
+    }   
+    return false;
+}
+
+//best
+bool hitTriangleNoRec(in Ray r, int i, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz;
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = vec3(
+        r.d.y * v2.z - r.d.z * v2.y,
+        r.d.z * v2.x - r.d.x * v2.z,
+        r.d.x * v2.y - r.d.y * v2.x
+    );
+
+    //vec3 pv = cross(r.d, v2);
+
+    float det = v1.x * pv.x + v1.y * pv.y + v1.z * pv.z;
+    if (abs(det) < 1e-6) return false;
+    //if (det == 0.0) return false;
+
+    float inv_det = 1.0 / det;
+    vec3 tv = r.o - v0;
+
+    float u = (tv.x * pv.x + tv.y * pv.y + tv.z * pv.z) * inv_det;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qv = vec3(
+        tv.y * v1.z - tv.z * v1.y,
+        tv.z * v1.x - tv.x * v1.z,
+        tv.x * v1.y - tv.y * v1.x
+    );
+
+    float v = (r.d.x * qv.x + r.d.y * qv.y + r.d.z * qv.z) * inv_det;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float tHit = (v2.x * qv.x + v2.y * qv.y + v2.z * qv.z) * inv_det;
+    if (tHit <= 0.0 || tHit >= t) return false;
+
+    return true;
+}
+
+void compute_normal_texcoord_and_material(inout HitRecord rec)
+{
+    int triangle_ind = rec.triangle_ind;
+    int mtl_ind = (rec.mtl_ind);
+    ivec4 vn = triangles[3 * triangle_ind + 1];
+    
+    if (vn.w == 0)
+        rec.n = vn.xyz;
+    else
+    {
+        vec3 vn0 = normals[vn.x].xyz;
+        vec3 vn1 = normals[vn.y].xyz;
+        vec3 vn2 = normals[vn.z].xyz;
+        rec.n = interpolate(vn0, vn1, vn2, rec.u, rec.v);
+    }
+    
+    rec.tex_ind = materials[4 * mtl_ind + 3];
+    rec.emission = materials[4 * mtl_ind + 1];
+    rec.specular = materials[4 * mtl_ind + 2];
+
+    if (rec.tex_ind.x != -1)
+    {
+        ivec4 vt = triangles[3 * triangle_ind + 2];
+        vec2 vt0 = texcoords[vt.x].xy;
+        vec2 vt1 = texcoords[vt.y].xy;
+        vec2 vt2 = texcoords[vt.z].xy;
+        rec.texcoord = interpolate(vt0, vt1, vt2, rec.u, rec.v);
+        rec.albedo = texture(albedo_textures, vec3(rec.texcoord, rec.tex_ind.x));
+    }
+    else
+        rec.albedo = materials[4 * mtl_ind];
+}
+
+/*vec4 hit_bbox4_parallel(int node_idx, vec3 r_o, vec3 invdir, ivec4 triangle_count, out vec4 out_th)
+{
+    // ??c chính xác 8 vec4 liên ti?p t? b? ??m bvh ph?ng (128 bytes lý t??ng cho Cache Line)
+    int base = node_idx * 8;
+    vec4 bmin_x = bvh[base + 0];
+    vec4 bmin_y = bvh[base + 1];
+    vec4 bmin_z = bvh[base + 2];
+    vec4 bmax_x = bvh[base + 3];
+    vec4 bmax_y = bvh[base + 4];
+    vec4 bmax_z = bvh[base + 5];
+
+    // L?p toán vector hóa: X? lý ??ng th?i 4 tr?c X, Y, Z c?a c? 4 h?p con
+    vec4 tbot_x = (bmin_x - r_o.x) * invdir.x;
+    vec4 ttop_x = (bmax_x - r_o.x) * invdir.x;
+    vec4 tmin_x = min(tbot_x, ttop_x);
+    vec4 tmax_x = max(tbot_x, ttop_x);
+
+    vec4 tbot_y = (bmin_y - r_o.y) * invdir.y;
+    vec4 ttop_y = (bmax_y - r_o.y) * invdir.y;
+    vec4 tmin_y = min(tbot_y, ttop_y);
+    vec4 tmax_y = max(tbot_y, ttop_y);
+
+    vec4 tbot_z = (bmin_z - r_o.z) * invdir.z;
+    vec4 ttop_z = (bmax_z - r_o.z) * invdir.z;
+    vec4 tmin_z = min(tbot_z, ttop_z);
+    vec4 tmax_z = max(tbot_z, ttop_z);
+
+    // Tìm kho?ng giao g?n nh?t (tl) và xa nh?t (th) theo chu?n toán h?c s?ch c?a b?n
+    vec4 tl = max(tmin_x, max(tmin_y, tmin_z));
+    vec4 th = min(tmax_x, min(tmax_y, tmax_z));
+    out_th = th;
+
+    // M?t n? ki?m tra h?p l?: 
+    // 1. tl <= th (Tia c?t qua h?p)
+    // 2. th >= 0.0 (H?p n?m phía tr??c tia)
+    // 3. triangle_count != -1 (Slot h?p con này có t?n t?i d? li?u th?c t?)
+    bvec4 hit_mask = lessThanEqual(tl, th) && greaterThanEqual(th, vec4(0.0f)) && greaterThanEqual(triangle_count, ivec4(0));
+
+    // N?u TRÚNG gi? nguyên `tl`, n?u TR??T gán b?ng h?ng s? inf (1e9) ?? Stack t? ??ng lo?i b?
+    return mix(vec4(inf), tl, hit_mask);
+}
+
+ #define SWAP_NODES(a, b) if (hit_dists[a] > hit_dists[b]) { \
+            float t_d = hit_dists[a]; hit_dists[a] = hit_dists[b]; hit_dists[b] = t_d; \
+            int t_n = hit_nodes[a]; hit_nodes[a] = hit_nodes[b]; hit_nodes[b] = t_n; \
+            int t_c = hit_counts[a]; hit_counts[a] = hit_counts[b]; hit_counts[b] = t_c; \
+        }
+*/
+
+
+/*bool trace_bvh_dfs_4way(Ray r, out HitRecord rec)
+{
+    int stk[64]; // Cây BVH4 nông h?n nh?ng c?n stack an toàn khi r? nhánh nhi?u con
+    int ptr = 0;
+    float t = inf;
+    const vec3 invdir = 1.0f / (r.d);
+   
+    int ind = 0; // B?t ??u t? nút g?c (Nút s? 0)
+    
+    while (ind != -1)
+    {
+        // L?y thông tin liên k?t ???c l?u tr? ? ph?n cu?i c?a c?m 8 vec4
+        int base = ind * 8;
+        ivec4 child_or_start = floatBitsToInt(bvh[base + 6]);
+        ivec4 triangle_count = floatBitsToInt(bvh[base + 7]);
+
+        // Bi?n nh?t k?t qu?
+        vec4 th_parallel;
+        vec4 tl_parallel = hit_bbox4_parallel(ind, r.o, invdir, triangle_count, th_parallel);
+
+        // L?c thêm m?t b??c: lo?i b? các h?p có kho?ng cách c?t xa h?n v?t th? g?n nh?t `t` hi?n t?i
+        bvec4 valid_dist_mask = lessThan(tl_parallel, vec4(t));
+        tl_parallel = mix(vec4(inf), tl_parallel, valid_dist_mask);
+
+        // Thu th?p thông tin 4 con vào m?ng c?c b? ph?ng trong thanh ghi
+        int hit_nodes[4] = int[](child_or_start.x, child_or_start.y, child_or_start.z, child_or_start.w);
+        int hit_counts[4] = int[](triangle_count.x, triangle_count.y, triangle_count.z, triangle_count.w);
+        float hit_dists[4] = float[](tl_parallel.x, tl_parallel.y, tl_parallel.z, tl_parallel.w);
+
+        
+        // Tr?ng thái m?c ??nh: tia ?i ti?p vào nút con g?n nh?t thu ???c
+        int next_ind = -1;
+
+        // Duy?t ng??c t? xa ??n g?n (t? ch? s? 3 v? 0) ?? ??y các nút xa vào Stack tr??c,
+        // ??m b?o khi POP Stack ra s? l?y ???c nút G?N NH?T ?? x? lý tr??c.
+        for (int i = 3; i >= 0; --i)
+        {
+            if (hit_dists[i] >= inf) continue; // B? qua n?u tr??t ho?c tr?ng
+
+            if (hit_counts[i] == 0) 
+            {
+                // ?ây là NÚT TRONG (Internal Node): ??y vào trình qu?n lý duy?t
+                if (next_ind == -1) next_ind = hit_nodes[i];
+                else stk[ptr++] = hit_nodes[i];
+            }   
+            else if (hit_counts[i] > 0)
+            {
+                // ?ây là NÚT LÁ (Leaf Node): ?âm th?ng vào vòng l?p cày tam giác
+                int start = hit_nodes[i];
+                int end   = start + hit_counts[i];
+                for (int tri_idx = end - 1; tri_idx >= start; --tri_idx) 
+                { 
+                    hit_triangle2(r, tri_idx, rec, t); 
+                }
+            }
+        }
+        
+        // C?p nh?t ch? s? nút ti?p theo ?? ch?y vòng l?p m?i
+        ind = (next_ind != -1) ? next_ind : ((ptr > 0) ? stk[--ptr] : -1);
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool hit_shadow_dfs_4way(Ray r, float max_t)
+{
+    int stk[64]; // Cây BVH4 nông h?n r?t nhi?u, 64 ph?n t? là an toàn tuy?t ??i
+    int ptr = 0;
+    vec3 invdir = 1.0f / r.d;
+
+    int ind = 0; // B?t ??u t? nút g?c
+
+    while (ind != -1)
+    {
+        int base = ind * 8;
+        ivec4 child_or_start = ivec4(bvh[base + 6]);
+        ivec4 triangle_count = ivec4(bvh[base + 7]);
+
+        // G?i hàm hit_bbox4_parallel th?n t?c c?a b?n ?? test song song 4 h?p
+        vec4 th_parallel;
+        vec4 tl_parallel = hit_bbox4_parallel(ind, r.o, invdir, triangle_count, th_parallel);
+
+        // L?c s?m: N?u m?t g?n tl c?a h?p còn xa h?n kho?ng cách ??n ?èn (max_t), coi nh? tr??t
+        bvec4 valid_shadow_mask = lessThan(tl_parallel, vec4(max_t));
+        tl_parallel = mix(vec4(inf), tl_parallel, valid_shadow_mask);
+
+        // TRÍCH XU?T PH?NG KHÔNG DÙNG VÒNG L?P S?P X?P (NO SORTING)
+        // Vì tia shadow không quan tâm g?n xa, ta ch? c?n ??y th?ng các nút h?p l? vào Stack
+        
+        // Slot 0
+        if (tl_parallel.x < inf) {
+            if (triangle_count.x == 0)      stk[ptr++] = child_or_start.x;
+            else {
+                int start = child_or_start.x; int end = start + triangle_count.x;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true; // C?t trúng tam giác -> Tr? v? bóng râm ngay!
+                }
+            }
+        }
+        // Slot 1
+        if (tl_parallel.y < inf) {
+            if (triangle_count.y == 0)      stk[ptr++] = child_or_start.y;
+            else {
+                int start = child_or_start.y; int end = start + triangle_count.y;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+        // Slot 2
+        if (tl_parallel.z < inf) {
+            if (triangle_count.z == 0)      stk[ptr++] = child_or_start.z;
+            else {
+                int start = child_or_start.z; int end = start + triangle_count.z;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+        // Slot 3
+        if (tl_parallel.w < inf) {
+            if (triangle_count.w == 0)      stk[ptr++] = child_or_start.w;
+            else {
+                int start = child_or_start.w; int end = start + triangle_count.w;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+
+        // L?y nút ti?p theo t? Stack ?? duy?t ti?p
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+    }
+    return false; // Toàn b? tia không b? c?n b?i b?t k? v?t th? nào
+}*/
+
+vec4 hit_bbox4_parallel(FlatNode4 node, vec3 r_o, vec3 invdir)
+{
+    vec4 tbot_x = (node.bmin_x - r_o.x) * invdir.x;
+    vec4 ttop_x = (node.bmax_x - r_o.x) * invdir.x;
+    vec4 tmin_x = min(tbot_x, ttop_x);
+    vec4 tmax_x = max(tbot_x, ttop_x);
+
+    vec4 tbot_y = (node.bmin_y - r_o.y) * invdir.y;
+    vec4 ttop_y = (node.bmax_y - r_o.y) * invdir.y;
+    vec4 tmin_y = min(tbot_y, ttop_y);
+    vec4 tmax_y = max(tbot_y, ttop_y);
+
+    vec4 tbot_z = (node.bmin_z - r_o.z) * invdir.z;
+    vec4 ttop_z = (node.bmax_z - r_o.z) * invdir.z;
+    vec4 tmin_z = min(tbot_z, ttop_z);
+    vec4 tmax_z = max(tbot_z, ttop_z);
+
+    vec4 tl = max(tmin_x, max(tmin_y, tmin_z));
+    vec4 th = min(tmax_x, min(tmax_y, tmax_z));
+
+    bvec4 mask1 = lessThanEqual(tl, th);
+    bvec4 mask2 = greaterThanEqual(th, vec4(0.0));
+    bvec4 mask3 = greaterThanEqual(node.triangle_count, ivec4(0));
+
+    bvec4 hit_mask = bvec4(
+        mask1.x && mask2.x && mask3.x,
+        mask1.y && mask2.y && mask3.y,
+        mask1.z && mask2.z && mask3.z,
+        mask1.w && mask2.w && mask3.w
+    );
+
+    return mix(vec4(inf), tl, hit_mask);
+}
+
+#define SWAP_NODES(a, b) if (hit_dists[a] > hit_dists[b]) { \
+            float t_d = hit_dists[a]; hit_dists[a] = hit_dists[b]; hit_dists[b] = t_d; \
+            int t_n = hit_nodes[a]; hit_nodes[a] = hit_nodes[b]; hit_nodes[b] = t_n; \
+            int t_c = hit_counts[a]; hit_counts[a] = hit_counts[b]; hit_counts[b] = t_c; \
+        }
+        //SWAP_NODES(0, 1); SWAP_NODES(2, 3);
+        //SWAP_NODES(0, 2); SWAP_NODES(1, 3);
+        //SWAP_NODES(1, 2);
+        //#undef SWAP_NODES
+
+bool trace_bvh_dfs_4way(Ray r, out HitRecord rec)
+{
+    int stk[64]; // Cây BVH4 nông h?n nh?ng c?n stack an toàn khi r? nhánh nhi?u con
+    int ptr = 0;
+    float t = inf;
+    const vec3 invdir = 1.0f / (r.d);
+   
+    int ind = 0; // B?t ??u t? nút g?c (Nút s? 0)
+    
+    while (ind != -1)
+    {
+        // T?I ?U S?CH S?: N?p nguyên m?t kh?i node struct t? buffer b?ng ID
+        FlatNode4 node = bvh[ind];
+
+        ivec4 child_or_start = node.child_or_start;
+        ivec4 triangle_count = node.triangle_count;
+
+        // Truy?n th?ng struct node vào hàm song song
+        vec4 tl_parallel = hit_bbox4_parallel(node, r.o, invdir);
+
+        // L?c kho?ng cách xa h?n t hi?n t?i
+        bvec4 valid_dist_mask = lessThan(tl_parallel, vec4(t));
+        tl_parallel = mix(vec4(inf), tl_parallel, valid_dist_mask);
+
+        int hit_nodes[4] = int[](child_or_start.x, child_or_start.y, child_or_start.z, child_or_start.w);
+        int hit_counts[4] = int[](triangle_count.x, triangle_count.y, triangle_count.z, triangle_count.w);
+        float hit_dists[4] = float[](tl_parallel.x, tl_parallel.y, tl_parallel.z, tl_parallel.w);
+
+        // --- SORT 4 NÚT CON KHÔNG R? NHÁNH B?NG THANH GHI V?I MACRO ---
+        /*#define SWAP_NODES(a, b) if (hit_dists[a] > hit_dists[b]) { \
+            float t_d = hit_dists[a]; hit_dists[a] = hit_dists[b]; hit_dists[b] = t_d; \
+            int t_n = hit_nodes[a]; hit_nodes[a] = hit_nodes[b]; hit_nodes[b] = t_n; \
+            int t_c = hit_counts[a]; hit_counts[a] = hit_counts[b]; hit_counts[b] = t_c; \
+        }
+        SWAP_NODES(0, 1); SWAP_NODES(2, 3);
+        SWAP_NODES(0, 2); SWAP_NODES(1, 3);
+        SWAP_NODES(1, 2);
+        #undef SWAP_NODES*/
+
+        SWAP_NODES(0, 1); SWAP_NODES(2, 3);
+        SWAP_NODES(0, 2); SWAP_NODES(1, 3);
+        SWAP_NODES(1, 2);
+
+        int next_ind = -1;
+
+        for (int i = 3; i >= 0; --i)
+        {
+            if (hit_dists[i] >= inf) continue; 
+
+            if (hit_counts[i] == 0) 
+            {
+                //if (next_ind == -1) next_ind = hit_nodes[i];
+                //else stk[ptr++] = hit_nodes[i];
+                // NÚT TRONG (Internal Node): 
+                if (ind == -1) {
+                    ind = hit_nodes[i]; // Gán tr?c ti?p làm m?c tiêu k? ti?p mà không t?n slot Stack
+                } else {
+                    if (ptr < 64) stk[ptr++] = hit_nodes[i]; // ??y vào Stack an toàn n?u có b?o v? ranh gi?i m?ng
+                }
+            }   
+            else //if (hit_counts[i] > 0)
+            {
+                int start = hit_nodes[i];
+                int end   = start + hit_counts[i];
+                for (int tri_idx = end - 1; tri_idx >= start; --tri_idx) 
+                { 
+                    hit_triangle2(r, tri_idx, rec, t); 
+                }
+            }
+        }
+        
+        ind = (next_ind != -1) ? next_ind : ((ptr > 0) ? stk[--ptr] : -1);
+        /*if (ind == -1 && ptr > 0)
+        {
+            ind = stk[--ptr];
+        }*/
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool hit_shadow_dfs_4way(Ray r, float max_t)
+{
+    int stk[64]; // Cây BVH4 nông h?n r?t nhi?u, 64 ph?n t? là an toàn tuy?t ??i
+    int ptr = 0;
+    vec3 invdir = 1.0f / r.d;
+
+    int ind = 0; // B?t ??u t? nút g?c
+
+    while (ind != -1)
+    {
+        // T?I ?U S?CH S?: N?p struct t? m?ng 
+        FlatNode4 node = bvh[ind];
+        ind = -1; // M?c ??nh ng?t n?u l??t này không tìm ???c nút trong m?i
+
+        vec4 tl_parallel = hit_bbox4_parallel(node, r.o, invdir);
+
+        bvec4 valid_shadow_mask = lessThan(tl_parallel, vec4(max_t));
+        tl_parallel = mix(vec4(inf), tl_parallel, valid_shadow_mask);
+        
+        // Slot 0
+        if (tl_parallel.x < inf) {
+            if (node.triangle_count.x == 0)  {    
+                      if (ind == -1) ind = node.child_or_start.x; 
+                      else if (ptr < 64) stk[ptr++] = node.child_or_start.x;
+            } else { //stk[ptr++] = node.child_or_start.x;
+                int start = node.child_or_start.x; int end = start + node.triangle_count.x;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true; 
+                }
+            }
+        }
+        // Slot 1
+        if (tl_parallel.y < inf) {
+            if (node.triangle_count.y == 0)  {    
+            //stk[ptr++] = node.child_or_start.y;
+                 if (ind == -1) ind = node.child_or_start.y; 
+                 else if (ptr < 64) stk[ptr++] = node.child_or_start.y;
+           
+            }else {
+                int start = node.child_or_start.y; int end = start + node.triangle_count.y;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+        // Slot 2
+        if (tl_parallel.z < inf) {
+            if (node.triangle_count.z == 0){ 
+            //stk[ptr++] = node.child_or_start.z;
+                     if (ind == -1) ind = node.child_or_start.z; 
+                     else if (ptr < 64) stk[ptr++] = node.child_or_start.z;
+           
+            }else {
+                int start = node.child_or_start.z; int end = start + node.triangle_count.z;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+        // Slot 3
+        if (tl_parallel.w < inf) {
+            if (node.triangle_count.w == 0){      //stk[ptr++] = node.child_or_start.w;
+                 if (ind == -1) ind = node.child_or_start.w; 
+                 else if (ptr < 64) stk[ptr++] = node.child_or_start.w;
+           
+           } else {
+                int start = node.child_or_start.w; int end = start + node.triangle_count.w;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+
+        //ind = (ptr > 0) ? stk[--ptr] : -1;
+        if (ind == -1 && ptr > 0)
+        {
+            ind = stk[--ptr];
+        }
+       //ind = (next_ind != -1) ? next_ind : ((ptr > 0) ? stk[--ptr] : -1);
+
+    }
+    return false; 
+}
+
+bool hit_shadow_dfs_4way2(Ray r, float max_t)
+{
+    int stk[64]; 
+    int ptr = 0;
+    vec3 invdir = 1.0f / r.d;
+
+    int ind = 0; 
+
+    while (ind != -1)
+    {
+        FlatNode4 node = bvh[ind];
+        ind = -1; // Reset ?? l?y m?c tiêu m?i t? Stack ho?c lu?ng con bên d??i
+
+        vec4 tl_parallel = hit_bbox4_parallel(node, r.o, invdir);
+
+        bvec4 valid_shadow_mask = lessThan(tl_parallel, vec4(max_t));
+        tl_parallel = mix(vec4(inf), tl_parallel, valid_shadow_mask);
+        
+        // shadow không c?n s?p x?p kho?ng cách, ch? c?n tìm th?y b?t kì va ch?m nào là d?ng s?m
+        // Slot 0
+        if (tl_parallel.x < inf) {
+            if (node.triangle_count.x == 0) {     
+                if (ind == -1) ind = node.child_or_start.x; else if (ptr < 64) stk[ptr++] = node.child_or_start.x;
+            } else {
+                int start = node.child_or_start.x; int end = start + node.triangle_count.x;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true; 
+                }
+            }
+        }
+        // Slot 1 (S?a l?i gán l?n bi?n .z t? b?n g?c)
+        if (tl_parallel.y < inf) {
+            if (node.triangle_count.y == 0) {     
+                if (ind == -1) 
+                ind = node.child_or_start.y; 
+                else if (ptr < 64) 
+                stk[ptr++] = node.child_or_start.y;
+            } else {
+                int start = node.child_or_start.y; 
+                int end = start + node.triangle_count.y;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+        // Slot 2
+        if (tl_parallel.z < inf) {
+            if (node.triangle_count.z == 0) {     
+                if (ind == -1) 
+                ind = node.child_or_start.z; 
+                else if (ptr < 64) 
+                stk[ptr++] = node.child_or_start.z;
+            } else {
+                int start = node.child_or_start.z; 
+                int end = start + node.triangle_count.z;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+        // Slot 3
+        if (tl_parallel.w < inf) {
+            if (node.triangle_count.w == 0) {
+                if (ind == -1) 
+                ind = node.child_or_start.w; 
+                else if (ptr < 64) 
+                stk[ptr++] = node.child_or_start.w;
+            } else {
+                int start = node.child_or_start.w; 
+                int end = start + node.triangle_count.w;
+                for (int i = end - 1; i >= start; --i) {
+                    if (hitTriangleNoRec(r, i, max_t)) return true;
+                }
+            }
+        }
+
+        // N?u lu?ng chính tr?ng, b?c ph?n t? trong ng?n x?p ra x? lý ti?p
+        if (ind == -1 && ptr > 0)
+        {
+            ind = stk[--ptr];
+        }
+    }
+    return false; 
+}
+
+vec3 sample_light_position(int li)
+{
+    Light4 l = lights[li];
+    vec3 p = l.p.xyz;
+    vec3 u = l.u.xyz;
+    vec3 v = l.v.xyz;
+    float s = sqrt(rand());
+    float b0 = 1.0f - s;
+    float b1 = rand() * s;
+    return p + b0 * u + b1 * v;
+}
+
+vec3 path_trace(inout Ray r)
+{
+	vec3 L = vec3(0.0f);
+	vec3 T = vec3(1.0f);
+
+	float prev_pdf = 1.0f;
+
+
+	//Ray new_ray = r;
+	bool is_specular = true;
+
+	for(int i = 0; i < 3; ++i)
+	{
+        if (i >= 1)
+	    {
+	        // Max throughput component determines survival probability
+			float p = max(T.x, max(T.y, T.z));
+			
+			// Cap the survival probability to prevent infinite energy variance
+			//if (p > 0.95f) p = 0.95f; 
+            if (p > 0.6f) p = 0.6f; 
+
+			// Use your rand() function to evaluate Russian Roulette condition
+			if (rand() > p)
+			{
+		        break; // Terminate the ray path early
+			}
+
+			// Unbias the throughput vector with the survival probability
+			T /= p; 
+		}
+	    HitRecord rec;
+		
+        if(trace_bvh_dfs_4way(r, rec))
+        //if(trace_bvh_dfs(r, rec))
+        //if(trace_bvh_dfs_bitstack(r, rec))
+        //if(trace_bvh_dfs_vectorized(r, rec))
+        {
+			float cos_incident = dot(r.d, rec.n);
+
+			vec3 original_n = rec.n;
+
+			if (cos_incident > 0)
+				rec.n = -rec.n;
+
+			vec4 emission = rec.emission;
+
+			if(emission.w != -1)
+			{
+				if(!is_specular)
+				{
+					vec3 light_direction = r.d * rec.t;
+
+					float length = length(light_direction);
+
+					light_direction = normalize(light_direction);
+
+					float cos_light = (-dot(light_direction, rec.n));//ko can abs
+
+					float length2 = length * length;
+
+					int light_index = int(emission.w);//int(vt.w);
+
+					
+					//Light4 l = lights[light_index];
+					//vec3 light_area_pdf = l.area_pdf.xyz;
+
+                    vec3 light_area_pdf = lights[light_index].area_pdf.xyz;
+					
+                    float pdf_light = length2 / (light_area_pdf.x * cos_light) * light_area_pdf.y;
+					float mis_weight = power_heuristic(prev_pdf, pdf_light);
+
+					
+					L += T * emission.xyz * mis_weight;
+
+					return L;
+				}
+                else
+				{
+					L += T * emission.xyz;
+					return L;
+				}
+			}
+
+			vec3 hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+
+            vec4 specular = rec.specular;
+
+			if(specular.w == 0)
+			{
+				int light_index = int(rand() * numLights);
+				
+				vec3 light_position = sample_light_position(light_index);
+
+				vec3 light_direction = light_position - hit_point;
+
+				float length = length(light_direction);
+
+				float ilength = 1.0f / length;
+
+				light_direction *= ilength;
+
+				float cos_mtl = dot(light_direction, original_n);
+
+				//float cos_light = dot(light_direction, rec.n);
+
+				Ray light_ray = Ray(hit_point, light_direction);
+
+                //Ray light_ray = Ray(light_position, -light_direction);
+
+				Light4 l = lights[light_index];
+
+				vec3 light_normal = l.n.xyz;
+				
+				float cos_light = ((dot(light_direction, light_normal)));
+
+                if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_dfs_4way(light_ray, length))		
+                //if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_dfs(light_ray, length))		
+                {	
+					//Light4 l = lights[light_index];
+					
+					vec3 light_emission = l.e.xyz;
+					
+					vec3 light_area_pdf = l.area_pdf.xyz;
+					
+					float pdf_light = (length * length) / (light_area_pdf.x * -cos_light) * light_area_pdf.y;
+
+					vec3 bsdf_eval = diffuse_bsdf(r, rec, light_direction);
+
+					float bsdf_pdf = diffuse_pdf(r, rec, light_direction);
+
+                    //divide pdf_light
+					//float mis_weight = power_heuristic(pdf_light, bsdf_pdf);
+
+                    //normal no clamp
+					//L += T * light_emission * bsdf_eval * mis_weight / pdf_light;
+
+                    //already divide pdf_light
+                    float mis_weight = power_heuristic_divide(pdf_light, bsdf_pdf);
+
+                    L += T * light_emission * bsdf_eval * mis_weight;// / pdf_light;
+
+                    //vec3 incoming_L = T * light_emission * bsdf_eval * mis_weight / pdf_light;
+
+                    // Ng?n ch?n các tia n?y may m?n mang n?ng l??ng vô lý phá ho?i b?c tranh (Firefly)
+                    //float max_allowed_intensity = 5.0f; // B?n có th? tinh ch?nh t? 2.0f ??n 10.0f tùy ?? r?c c?a l?a
+                    //incoming_L = clamp(incoming_L, vec3(0.0f), vec3(max_allowed_intensity));
+
+                    //vec3 incoming_L = T * light_emission * bsdf_eval * mis_weight / pdf_light;
+
+                    // Ch? t?n 1 chu k? ph?n c?ng c?a GPU thay vì 6 chu k? nh? hàm clamp c?
+                    //incoming_L = min(incoming_L, vec3(10.0f)); 
+
+                    //L += incoming_L;
+					
+				}
+			}
+
+			//Sample for new ray
+			vec3 sample_direction = diffuse_sample(r, rec.n);
+			vec3 new_hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+
+			vec3 sample_eval = diffuse_bsdf(r, rec, sample_direction);
+
+			float bsdf_pdf = diffuse_pdf(r, rec, sample_direction);
+
+            //no russian roulette
+			T *= sample_eval;
+
+            float energy = max(T.x, max(T.y, T.z));
+            if (energy < 0.01f) 
+            {
+                break; 
+            }
+               
+
+			prev_pdf = bsdf_pdf;
+
+			is_specular = false;
+
+			r.o = new_hit_point;
+			r.d = sample_direction;
+
+			//r = Ray(new_hit_point, sample_direction);
+		}
+		else
+			return L;
+	}
+	return L;
+}
+
+//best
+void main()
+{
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoords.x >= int(screenResolution.x) || pixelCoords.y >= int(screenResolution.y))  
+        return;   
+
+    if (gl_LocalInvocationIndex == 0)
+        shared_workgroup_active = false;
+
+    float current_variance = 0.0f;
+    float current_luminance = 0.0f;
+    vec4 history_data = vec4(0.0f);
+
+    history_data = imageLoad(variance_history_tex, pixelCoords);
+    float history_mean_lum = history_data.r;//light source, whiout this, light will get weaker and grayer
+    float history_m2 = history_data.a;
+
+    if(currentFrameSample > MIN_SAMPLES)
+        current_variance = history_m2 / float(currentFrameSample - 1);
+    else
+        current_variance = 1.0f;
+
+    if (history_mean_lum > 1.5f) 
+    {
+        current_variance = 1.0f; // B?t bu?c cày ti?p, không cho phép skip s?m
+    }
+
+    if(current_variance > VARIANCE_THRESHOLD)
+        shared_workgroup_active = true;
+
+   // ??ng b? hóa tr?ng thái b? nh? Shared sau khi toàn b? lu?ng ?ã b? phi?u
+    memoryBarrierShared();
+    barrier();
+
+    // ============================================================
+    // B?Y WARP DIVERGENCE ???C GI?I QUY?T ? ?ÂY
+    // N?u c? c?m 8x8 ??u có variance < threshold, shared_workgroup_active s? gi? nguyên là false.
+    // Toàn b? 64 lu?ng (Warp) cùng thoát ??ng th?i, tri?t tiêu lãng phí chu k? c?a GPU!
+    // ============================================================
+    if (!shared_workgroup_active)
+    {
+        return; 
+    }
+
+    vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+	
+    // T?o Jitter TAA theo khung hình gi?ng b?n main_final c?a b?n
+    float jitter_offset_x = (currentFrameSample % 2 == 0) ? 0.25f : -0.25f;
+    float jitter_offset_y = ((currentFrameSample / 2) % 2 == 0) ? 0.25f : -0.25f;
+    vec2 jittered_uv = (vec2(pixelCoords) + vec2(0.5f) + vec2(jitter_offset_x, jitter_offset_y)) / screenResolution;
+    seed = jittered_uv;
+
+    //normal
+	float r1 = 2.0f * rand();
+	float r2 = 2.0f * rand();
+
+	vec2 jitter;
+
+	jitter.x = r1 < 1.0 ? sqrt(r1) - 1.0f : 1.0f - sqrt(2.0f - r1);
+	jitter.y = r2 < 1.0 ? sqrt(r2) - 1.0f : 1.0f - sqrt(2.0f - r2);
+	jitter /= (screenResolution * 0.5f);
+
+	vec2 d = (2.0f * texCoords - 1.0f) + jitter;
+
+	float tan_fov = tan(camera.fov * 0.5f);
+	d.x *= screenResolution.x / screenResolution.y * tan_fov;
+	d.y *= tan_fov;
+
+	vec3 rayDir = normalize(d.x * camera.right + d.y * camera.up + camera.forward);
+
+	Ray ray = Ray(camera.position, rayDir);
+
+	vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+    
+    vec3 pixelColor = path_trace(ray);
+
+    //fail
+    //vec3 pixelColor = path_trace_wald(ray);
+
+    vec3 final_color = pixelColor + accumulate_color;
+
+    imageStore(img_output, pixelCoords, vec4(pixelColor + accumulate_color, 1.0f));
+
+
+    // ============================================================
+    // THU?T TOÁN WELFORD TÍNH VARIANCE ONLINE (CHUY?N HÓA SANG GLSL)
+    // ============================================================
+    // Trích xu?t s?c ?? (Luminance) c?a m?u màu hi?n t?i
+    float new_luminance = dot(pixelColor, vec3(0.2126, 0.7152, 0.0722));
+        
+    float old_mean = history_data.r;
+    float old_m2 = history_data.a;
+        
+    // 1. C?p nh?t giá tr? trung bình ch?y l?y ti?n (Running Mean)
+    float current_sample_weight = 1.0f / float(currentFrameSample + 1);
+    float new_mean = mix(old_mean, new_luminance, current_sample_weight);
+        
+    // 2. Tính toán t?ng bình ph??ng kho?ng cách sai s? l?y ti?n (Running M2)
+    float delta0 = new_luminance - old_mean;
+    float delta1 = new_luminance - new_mean;
+    float new_m2 = old_m2 + delta0 * delta1;
+
+    // L?u ng??c l?i Texture phân tích ?? chu?n b? cho khung hình ti?p theo
+    imageStore(variance_history_tex, pixelCoords, vec4(new_mean, 0.0f, 0.0f, new_m2));
+}
+

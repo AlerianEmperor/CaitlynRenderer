@@ -1,0 +1,1352 @@
+#version 460 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uniform int tree_height;
+int bvh_height = tree_height;
+uniform int currentFrameSample;
+
+layout(std430, binding = 1) restrict readonly buffer vertices_buf
+{
+    vec4 vertices[];
+};
+
+layout(std430, binding = 2) buffer normals_buf
+{
+    vec4 normals[];
+};
+
+layout(std430, binding = 3) buffer texcoords_buf
+{
+    vec2 texcoords[];
+};
+
+layout(std430, binding = 4) restrict readonly buffer triangles_buf
+{
+    ivec4 triangles[];
+};
+
+layout(std430, binding = 5) buffer mats_buf
+{
+    vec4 materials[];
+};
+
+struct Light4
+{
+    vec4 p;
+    vec4 u;
+    vec4 v;
+    vec4 e;
+    vec4 n;
+    vec4 area_pdf;
+};
+
+layout(std430, binding = 6) buffer light_buf
+{
+    Light4 lights[];
+};
+
+layout(std430, binding = 7) readonly buffer bvh_buf
+{
+    vec4 bvh[];
+};
+
+layout(binding = 8) uniform sampler2DArray albedo_textures;
+
+layout(rgba32f, binding = 9) uniform image2D img_output;
+
+layout(binding = 10) uniform sampler2D accumulate_tex;
+
+#define pi 3.1415926
+#define pi2 6.2831853
+#define ipi 1.0f / pi
+
+struct Ray { vec3 o; vec3 d; };
+struct Camera { vec3 up; vec3 right; vec3 forward; vec3 position; float fov; float focalDist; float aperture; };
+
+vec2 seed;
+
+uniform Camera camera;
+uniform vec2 screenResolution;
+uniform vec2 randomVector;
+uniform int numLights;
+
+#define inf 1e9
+#define eps 1e-4f
+
+float rand()
+{
+    seed -= vec2(randomVector.x * randomVector.y);
+    uint state = floatBitsToUint(seed.x * 1234567.0 + seed.y * 7654321.0);
+    return fract(sin(dot(seed, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void onb(in vec3 n, out vec3 b1, out vec3 b2)
+{
+    if (n.z < -0.999f) {
+        b1 = vec3(0, -1, 0);
+        b2 = vec3(-1, 0, 0);
+    } else {
+        float a = 1.0 / (1.0 + n.z);
+        float b = -n.x * n.y * a;
+        b1 = vec3(1.0 + b, b, -n.x);
+        b2 = vec3(b, 1.0 + b, -n.y);
+    }
+}
+
+
+//best
+float hit_bbox4(Ray r, vec3 bmin, vec3 bmax, vec3 invdir, out float tl)
+{
+    bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    vec3 t1 = mix(bmax, bmin, is_pos); // Trong GLSL m?i, mix v?i bvec3 ho?t ??ng nh? hàm ch?n ph?n c?ng (select)
+    vec3 t2 = mix(bmin, bmax, is_pos);
+
+    t1 = (t1 - r.o) * invdir;
+    t2 = (t2 - r.o) * invdir;
+
+  
+    //tl = max(tmin3.x, max(tmin3.y, tmin3.z));
+    //float th = min(tmax3.x, min(tmax3.y, tmax3.z));
+    
+    tl = max(max(t1.x, t1.y), t1.z);
+    return min(min(t2.x, t2.y), t2.z);
+
+    //return th; 
+}
+
+float hit_bbox7(vec3 o, vec3 bmin, vec3 bmax, vec3 invdir, out float tl)
+{
+    bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    vec3 t1 = mix(bmax, bmin, is_pos); // Trong GLSL m?i, mix v?i bvec3 ho?t ??ng nh? hàm ch?n ph?n c?ng (select)
+    vec3 t2 = mix(bmin, bmax, is_pos);
+
+    t1 = (t1 - o) * invdir;
+    t2 = (t2 - o) * invdir;
+
+  
+    //tl = max(tmin3.x, max(tmin3.y, tmin3.z));
+    //float th = min(tmax3.x, min(tmax3.y, tmax3.z));
+    
+    tl = max(max(t1.x, t1.y), t1.z);
+    return min(min(t2.x, t2.y), t2.z);
+
+    //return th; 
+}
+
+float power_heuristic(float a, float b)
+{
+    float t = a * a;
+    return t / (b * b + t);
+}
+
+struct HitRecord
+{
+    vec4 albedo;  
+    vec4 emission;
+    vec4 specular;
+    vec4 tex_ind;
+    vec3 n;
+    vec2 texcoord;
+    float u;
+    float v;
+    float t;
+    int triangle_ind;
+    int mtl_ind;
+};
+
+vec3 cosine_hemisphere_sampling()
+{
+    float u1 = rand();
+    float u2 = rand();
+    float r = sqrt(u1);
+    float phi = pi2 * u2;
+    return vec3(r * cos(phi), r * sin(phi), sqrt(1.0f - u1));
+}
+
+vec3 diffuse_sample(in Ray r, vec3 n)
+{
+    vec3 u, v;
+    onb(n, u, v);
+    vec3 dir = cosine_hemisphere_sampling();
+    dir = u * dir.x + v * dir.y + n * dir.z;
+    return dir;
+}
+
+float diffuse_pdf(Ray r, inout HitRecord rec, in vec3 sample_direction)
+{
+    float cos = dot(sample_direction, rec.n);
+    return cos * ipi;
+}
+
+vec3 diffuse_bsdf(Ray r, inout HitRecord rec, in vec3 sample_direction)
+{
+    return rec.albedo.xyz;
+} 
+
+vec2 interpolate(vec2 a, vec2 b, vec2 c, float u, float v) { return a * (1.0f - u - v) + b * u + c * v; }
+vec3 interpolate(vec3 a, vec3 b, vec3 c, float u, float v) { return a * (1.0f - u - v) + b * u + c * v; }
+
+bool hit_triangle(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = vec3(
+        r.d.y * v2.z - r.d.z * v2.y,
+        r.d.z * v2.x - r.d.x * v2.z,
+        r.d.x * v2.y - r.d.y * v2.x
+    );
+
+    vec3 tv = r.o - v0;
+    vec3 qv = vec3(
+        tv.y * v1.z - tv.z * v1.y,
+        tv.z * v1.x - tv.x * v1.z,
+        tv.x * v1.y - tv.y * v1.x
+    );
+
+    vec4 uvt;
+    uvt.x = dot(tv, pv);
+    uvt.y = dot(r.d, qv);
+    uvt.z = dot(v2, qv);
+    float inv_det = 1.0f / dot(v1, pv);
+
+    uvt.xyz = uvt.xyz * inv_det;
+    uvt.w = 1.0 - uvt.x - uvt.y;
+    
+    if (all(greaterThanEqual(uvt, vec4(0.0f))) && uvt.z < t)
+    {
+        t = uvt.z;
+        rec.u = uvt.x;
+        rec.v = uvt.y;
+        rec.triangle_ind = i;
+        rec.mtl_ind = (triIndex.w);
+        return true;
+    }   
+    return false;
+}
+
+bool hit_triangle2(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = cross(r.d, v2);
+    float det = dot(v1, pv);
+
+    if (abs(det) < 1e-6) return false;
+    float inv_det = 1.0f / det;
+
+   vec3 tv = r.o - v0;
+    float u = dot(tv, pv) * inv_det;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qv = cross(tv, v1);
+    float v = dot(r.d, qv) * inv_det;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+   float t_hit = dot(v2, qv) * inv_det;
+    
+    if (t_hit > 0.0 && t_hit < t)
+    {
+        t = t_hit;
+        rec.u = u;
+        rec.v = v;
+        rec.triangle_ind = i;
+        rec.mtl_ind = triIndex.w;
+        return true;
+    }   
+    return false;
+}
+
+//best
+bool hitTriangleNoRec(in Ray r, int i, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz;
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = vec3(
+        r.d.y * v2.z - r.d.z * v2.y,
+        r.d.z * v2.x - r.d.x * v2.z,
+        r.d.x * v2.y - r.d.y * v2.x
+    );
+
+    float det = v1.x * pv.x + v1.y * pv.y + v1.z * pv.z;
+    if (det == 0.0) return false;
+
+    float inv_det = 1.0 / det;
+    vec3 tv = r.o - v0;
+
+    float u = (tv.x * pv.x + tv.y * pv.y + tv.z * pv.z) * inv_det;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qv = vec3(
+        tv.y * v1.z - tv.z * v1.y,
+        tv.z * v1.x - tv.x * v1.z,
+        tv.x * v1.y - tv.y * v1.x
+    );
+
+    float v = (r.d.x * qv.x + r.d.y * qv.y + r.d.z * qv.z) * inv_det;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float tHit = (v2.x * qv.x + v2.y * qv.y + v2.z * qv.z) * inv_det;
+    if (tHit <= 0.0 || tHit >= t) return false;
+
+    return true;
+}
+
+
+void compute_normal_texcoord_and_material(inout HitRecord rec)
+{
+    int triangle_ind = rec.triangle_ind;
+    int mtl_ind = (rec.mtl_ind);
+    ivec4 vn = triangles[3 * triangle_ind + 1];
+    
+    if (vn.w == 0)
+        rec.n = vn.xyz;
+    else
+    {
+        vec3 vn0 = normals[vn.x].xyz;
+        vec3 vn1 = normals[vn.y].xyz;
+        vec3 vn2 = normals[vn.z].xyz;
+        rec.n = interpolate(vn0, vn1, vn2, rec.u, rec.v);
+    }
+    
+    rec.tex_ind = materials[4 * mtl_ind + 3];
+    rec.emission = materials[4 * mtl_ind + 1];
+    rec.specular = materials[4 * mtl_ind + 2];
+
+    if (rec.tex_ind.x != -1)
+    {
+        ivec4 vt = triangles[3 * triangle_ind + 2];
+        vec2 vt0 = texcoords[vt.x].xy;
+        vec2 vt1 = texcoords[vt.y].xy;
+        vec2 vt2 = texcoords[vt.z].xy;
+        rec.texcoord = interpolate(vt0, vt1, vt2, rec.u, rec.v);
+        rec.albedo = texture(albedo_textures, vec3(rec.texcoord, rec.tex_ind.x));
+    }
+    else
+        rec.albedo = materials[4 * mtl_ind];
+}
+
+bool trace_bvh_dfs(Ray r, out HitRecord rec)
+{
+    int stk[32]; 
+    int ptr = 0;
+    float t = inf;
+    const vec3 invdir = 1.0f / (r.d);
+    const vec3 o = r.o;
+    //const vec3 roinvd = -r.o * invdir;
+
+    //ivec3 sign = get_ray_sign(invdir);
+    //vec3 is_negative = step(invdir, vec3(0.0));
+    //bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+    int ind = 0;
+    
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+            th1 = hit_bbox7(o, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, tl1);
+            th2 = hit_bbox7(o, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+
+            bool left  = (tl1 <= th1) && (th1 > 0.0f) && (tl1 < t);
+            bool right = (tl2 <= th2) && (th2 > 0.0f) && (tl2 < t);
+
+            //bool left  = max(tl1, 0.0f) <= min(th1, t);
+            //bool right = max(tl2, 0.0f) <= min(th2, t);
+
+            if (left && right)
+            {
+                //if (tl1 < tl2) { stk[ptr++] = rightIndex; ind = leftIndex; }
+                //else { stk[ptr++] = leftIndex; ind = rightIndex; }
+                //continue;
+
+                int closer_node = (tl1 < tl2) ? leftIndex  : rightIndex;
+                int farther_node = (tl1 < tl2) ? rightIndex : leftIndex;
+
+                stk[ptr++] = farther_node; // ??y nút xa vào danh sách ch?
+                ind = closer_node;         // ?u tiên ?i sâu xu?ng nút g?n tr??c
+                continue;
+            }
+            else if (left) { ind = leftIndex; continue; }
+            else if (right) { ind = rightIndex; continue; }
+            /*else
+            {
+                ind = (ptr > 0) ? stk[--ptr] : -1; continue;
+            }*/
+        }   
+        else 
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = start; i < end; ++i) { hit_triangle2(r, i, rec, t); }
+        }
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+        /*ind = -1;
+        while(ptr > 0)
+        {
+            int next_ind = stk[--ptr];
+            ind = next_ind;
+            break;
+        }*/
+        /*ind = -1;
+        while (ptr > 0) 
+        {
+            ptr--; 
+            if (stk_t[ptr] < t) 
+            {
+                ind = stk[ptr];
+                break;
+            }
+        }*/
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool hit_shadow_dfs(Ray r, float max_t)
+{
+    int stk[32];
+
+    int ptr = 0;
+    vec3 invdir = 1.0f / r.d;
+    const vec3 o = r.o;
+    //ivec3 sign = get_ray_sign(invdir);
+    //const vec3 is_negative = step(invdir, vec3(0.0));
+    //bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    //vec3 abs_dir = abs(r.d);
+    //int main_axis = (abs_dir.x > abs_dir.y) ? ((abs_dir.x > abs_dir.z) ? 0 : 2) : ((abs_dir.y > abs_dir.z) ? 1 : 2);
+    //bool choose_left = invdir[main_axis] >= 0.0f;
+
+    int ind = 0;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+            th1 = hit_bbox7(o, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz,  invdir, tl1);
+            th2 = hit_bbox7(o, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+
+            bool left  = (tl1 <= th1) && (th1 > 0.0) && (tl1 < max_t);
+            bool right = (tl2 <= th2) && (th2 > 0.0) && (tl2 < max_t);
+
+            //bool left  = (tl1 <= th1) && (th1 > 0.0f) && (tl1 < max_t) && (th1 <= max_t);
+            //bool right = (tl2 <= th2) && (th2 > 0.0f) && (tl2 < max_t) && (th2 <= max_t);
+
+            //bool left  = max(tl1, 0.0001f) <= min(th1, max_t);
+            //bool right = max(tl2, 0.0001f) <= min(th2, max_t);
+
+            if (left && right) 
+            { 
+                //stk[ptr++] = rightIndex; 
+                //ind = leftIndex; continue; 
+
+                /*int first  = choose_left ? leftIndex : rightIndex;
+                int second = choose_left ? rightIndex : leftIndex;
+
+                stk[ptr++] = second; 
+                ind = first; 
+                continue;*/
+
+                int closer_node = (tl1 < tl2) ? leftIndex  : rightIndex;
+                int farther_node = (tl1 < tl2) ? rightIndex : leftIndex;
+
+                stk[ptr++] = farther_node; // ??y nút xa vào danh sách ch?
+                ind = closer_node;         // ?u tiên ?i sâu xu?ng nút g?n tr??c
+                continue;
+            }
+            else if (left) { ind = leftIndex; continue; }
+            else if (right) { ind = rightIndex; continue; }
+        }
+        else 
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = start; i < end; ++i) 
+            {
+                if (hitTriangleNoRec(r, i, max_t)) return true;
+            }
+        }   
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+    }
+    return false;
+}
+
+
+//fail
+bool trace_bvh_stackless(Ray r, out HitRecord rec)
+{
+    float t = inf;
+    const vec3 invdir = 1.0f / r.d;
+    const vec3 o = r.o;
+    int ind = 0; // B?t ??u t? nút g?c Root
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        
+        int range = int(bmax.w);       // range > 0 là nút lá
+        int skip_idx = int(bmin.w);    // M?c tiêu nh?y khi tr??t h?p
+
+        float tl, th;
+        th = hit_bbox7(o, bmin.xyz, bmax.xyz, invdir, tl);
+
+        // Ki?m tra ?i?u ki?n si?t ch?t kho?ng cách t ??ng c?a tia chính
+        bool hit = (max(tl, 0.0f) < min(th, t));
+
+        if (hit)
+        {
+            if (range == 0) 
+            {
+                // Nút trong: N?u TRÚNG h?p, ?i ti?p vào nút con bên trái (n?m ngay k? ti?p)
+                ind = ind + 1;
+                continue;
+            }   
+            else 
+            {
+                // Nút lá: Ti?n hành giao c?t v?i danh sách tam giác
+                int start = int(bmin.w); // L?u ý: N?u bmin.w dùng làm skip, hãy thi?t k? l?i c?u trúc nén ?? gi? c? start
+                // M?o thi?t k? t?i ?u: ??i v?i nút lá, con c?a nó không có con trái/ph?i nên skip_idx th?c ch?t không c?n dùng n?a!
+                // B?n có th? l?u 'start' vào bmin.w c?a nút lá, còn ??i v?i nút trong bmin.w l?u 'skip_index'.
+                int start_tri = int(bmin.w); 
+                int end_tri   = start_tri + range;
+                
+                for (int i = start_tri; i < end_tri; ++i) { 
+                    hit_triangle(r, i, rec, t); 
+                }
+                
+                // Duy?t xong nút lá, theo logic DFS ta bu?c ph?i nh?y sang nút ti?p theo trong hàng ??i ph?ng
+                // ??i v?i nút lá, ?ích ??n ti?p theo chính là m?c tiêu skip ?ã tính tr??c t? CPU
+                ind = skip_idx; 
+            }
+        }
+        else
+        {
+            // N?u TR??T h?p: Nh?y th?ng qua toàn b? cây con t?i m?c tiêu skip_index mà không c?n dùng Stack!
+            ind = skip_idx;
+        }
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool hit_shadow_bitstack(Ray r, float max_t)
+{
+    vec3 invdir = 1.0f / r.d;
+    const vec3 o = r.o;
+
+    // Khai báo Bit-Stack ch?y tr?c ti?p trên thanh ghi Register, không t?n m?ng
+    uint bit_stack = 0u; 
+    int current_depth = 0; // Qu?n lý t?ng cây hi?n t?i b?ng bit-index
+
+    int ind = 0;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) // Nút trong
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); // ??c ch? s? con ph?i ?ã tính tr??c t? CPU
+
+            float tl1, th1, tl2, th2;
+            th1 = hit_bbox7(o, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz,  invdir, tl1);
+            th2 = hit_bbox7(o, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+
+            bool left  = (tl1 <= th1) && (th1 > 0.0) && (tl1 < max_t);
+            bool right = (tl2 <= th2) && (th2 > 0.0) && (tl2 < max_t);
+
+            if (left && right) 
+            { 
+                // T?I ?U BIT: C? 2 cùng trúng, ghi nh? nhánh ph?i vào bit-stack b?ng phép d?ch bit
+                bit_stack |= (1u << uint(current_depth));
+                current_depth++;
+                ind = leftIndex; // ?u tiên ?i nhánh trái tr??c
+                continue; 
+            }
+            else if (left)  { current_depth++; ind = leftIndex;  continue; }
+            else if (right) { current_depth++; ind = rightIndex; continue; }
+        }
+        else // Nút lá
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = start; i < end; ++i) 
+            {
+                if (hitTriangleNoRec(r, i, max_t)) return true;
+            }
+        }   
+
+        // ?O?N POP BIT-STACK PH?NG: Không dùng m?ng, không t?n l?nh r? nhánh if/else l?ng nhau
+        ind = -1;
+        while (current_depth > 0)
+        {
+            current_depth--;
+            // Ki?m tra xem t?i t?ng này có nút xa nào ?ang ch? không
+            if ((bit_stack & (1u << uint(current_depth))) != 0u)
+            {
+                // T?t bit ?ó ?i (quay xe sang nhánh ph?i)
+                bit_stack &= ~(1u << uint(current_depth));
+                
+                // Tính toán ch? s? nút ph?i d?a trên logic cây con. 
+                // ?? chu?n nh?t, b?n có th? l?u liên k?t quay ng??c trong c?u trúc bvh, 
+                // ho?c ch?p nh?n lùi ng??c dòng l?nh.
+                // N?u th?y logic quay xe ? nút trong ph?c t?p, hãy xem K? thu?t 2 bên d??i.
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+bool hit_shadow_bitstack_fixed(Ray r, float max_t)
+{
+    vec3 invdir = 1.0f / r.d;
+    const vec3 o = r.o;
+
+    // Bit-stack l?u quy?t ??nh: 1 ngh?a là nhánh ph?i c?a t?ng này ch?a duy?t
+    uint bit_stack = 0u; 
+    int current_depth = 0; 
+
+    // M?ng thanh ghi c?c b? c?c nh? ?? L?U CH? S? NÚT CON PH?I KHI ?I XU?NG
+    // M?ng này không dùng ?? pop/??y ph?n t? mò m?m, nó ch? là m?t cu?n s? ghi chép ??a ch?
+    int right_nodes[32]; 
+
+    int ind = 0;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) // Nút trong
+        {
+            int leftIndex  = ind + 1; 
+            // C?u trúc DFS c? c?a b?n: Ch? s? con ph?i ???c CPU l?u ? kênh .w c?a bmin
+            int rightIndex = int(bmin.w); 
+
+            float tl1, th1, tl2, th2;
+            th1 = hit_bbox7(o, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz,  invdir, tl1);
+            th2 = hit_bbox7(o, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+
+            bool left  = (tl1 <= th1) && (th1 > 0.0) && (tl1 < max_t);
+            bool right = (tl2 <= th2) && (th2 > 0.0) && (tl2 < max_t);
+
+            if (left && right) 
+            { 
+                // Ghi nh? vào s? ??a ch?: T?ng này có con ph?i ?ang ch? ? v? trí rightIndex
+                right_nodes[current_depth] = rightIndex;
+                
+                // B?t bit ?ánh d?u t?ng này ch?a duy?t h?t
+                bit_stack |= (1u << uint(current_depth));
+                current_depth++;
+                
+                ind = leftIndex; // ?i xu?ng con trái
+                continue; 
+            }
+            else if (left)  
+            { 
+                current_depth++; 
+                ind = leftIndex;  
+                continue; 
+            }
+            else if (right) 
+            { 
+                current_depth++; 
+                ind = rightIndex; 
+                continue; 
+            }
+        }
+        else // Nút lá
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = start; i < end; ++i) 
+            {
+                if (hitTriangleNoRec(r, i, max_t)) return true;
+            }
+        }   
+
+        // ?O?N QUAY XE (POP BIT-STACK CHU?N XÁC):
+        ind = -1;
+        while (current_depth > 0)
+        {
+            current_depth--;
+            // Ki?m tra xem t?ng này có con ph?i ?ang n?m ch? không
+            if ((bit_stack & (1u << uint(current_depth))) != 0u)
+            {
+                // T?t bit ?i (vì bây gi? chúng ta chu?n b? nh?y vào nó)
+                bit_stack &= ~(1u << uint(current_depth));
+                
+                // L?y chính xác ??a ch? nút con ph?i ra t? s? ghi chép thanh ghi
+                ind = right_nodes[current_depth];
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+//fail
+bool hit_shadow_stackless(Ray r, float max_t)
+{
+    vec3 invdir = 1.0f / r.d;
+    const vec3 o = r.o;
+    int ind = 0;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        
+        int range = int(bmax.w);
+        int skip_idx = int(bmin.w);
+
+        float tl, th;
+        th = hit_bbox7(o, bmin.xyz, bmax.xyz, invdir, tl);
+
+        // Áp d?ng ?i?u ki?n giao thoa kho?ng cách c?c ch?t c?a tia shadow
+        bool hit = (max(tl, 0.0001f) <= min(th, max_t));
+
+        if (hit)
+        {
+            if (range == 0) 
+            {
+                ind = ind + 1; // Trúng nút trong -> ?i vào con trái k? bên
+                continue;
+            }
+            else 
+            {
+                int start_tri = int(bmin.w);
+                int end_tri   = start_tri + range;
+                for (int i = start_tri; i < end_tri; ++i) 
+                {
+                    if (hitTriangleNoRec(r, i, max_t)) return true; // Any-hit k?t thúc luôn!
+                }
+                ind = skip_idx; // Duy?t xong lá mà không ch?n sáng -> Nh?y t?i ô skip
+            }
+        }
+        else 
+        {
+            ind = skip_idx; // Tr??t h?p -> B? qua nhánh cây con luôn
+        }
+    }
+    return false;
+}
+
+bool trace_bvh_bitstack_pure(Ray r, out HitRecord rec)
+{
+    float t = inf;
+    const vec3 invdir = 1.0f / r.d;
+    const vec3 o = r.o;
+
+    // Bi?n bit qu?n lý toàn b? l? trình cây, ch?y tr?c ti?p trên Register
+    uint bit_stack = 0u; 
+    int current_depth = 0;
+
+    int ind = 0; // B?t ??u t? nút g?c Root
+    int prev_ind = -1;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        
+        int range = int(bmax.w);
+        int parent_idx = int(bmin.w); // ??c ch? s? nút cha ???c CPU tính s?n
+
+        // TR??NG H?P 1: ?I XU?NG CÂY (Duy?t xuôi t? trên xu?ng)
+        if (prev_ind == parent_idx || prev_ind == -1)
+        {
+            float tl, th;
+            th = hit_bbox7(o, bmin.xyz, bmax.xyz, invdir, tl);
+            
+            // Áp d?ng ?i?u ki?n si?t ch?t kho?ng cách t ??ng c?c k? nghiêm ng?t c?a tia chính
+            bool hit = (max(tl, 0.0f) < min(th, t));
+
+            if (hit)
+            {
+                if (range == 0) // Nút trong
+                {
+                    prev_ind = ind;
+                    ind = ind + 1; // M?c ??nh lao xu?ng con bên trái theo c?u trúc DFS
+                    current_depth++;
+                    continue;
+                }
+                else // Nút lá
+                {
+                    int start = int(bmin.w); // Nén c?u trúc d? li?u lá (start/range)
+                    int end   = start + range;
+                    
+                    // Ti?n hành giao c?t v?i danh sách tam giác trong nút lá
+                    for (int i = start; i < end; ++i) 
+                    {
+                        hit_triangle(r, i, rec, t); // C?p nh?t kho?ng cách 't' g?n nh?t n?u trúng
+                    }
+                    // Duy?t xong nút lá, tia chính ép máy tr?ng thái chuy?n sang ?i lên cha
+                }
+            }
+            // N?u tr??t h?p HO?C duy?t xong nút lá -> B?t ??u l?i ng??c dòng lên trên
+            prev_ind = ind;
+            ind = parent_idx;
+            current_depth--;
+            continue;
+        }
+
+        // TR??NG H?P 2: L?I NG??C DÒNG LÊN TRÊN (Duy?t ng??c t? d??i lên)
+        int left_child_idx = ind + 1;
+        
+        // N?u ta v?a t? nhánh con bên trái ?i lên, ngh?a là còn nhánh con bên ph?i ch?a xét
+        if (prev_ind == left_child_idx)
+        {
+            uint mask = (1u << uint(current_depth));
+            
+            // N?u bit t?i t?ng này b?ng 0 -> Nhánh ph?i c?a nút này ch?a t?ng ???c duy?t
+            if ((bit_stack & mask) == 0u)
+            {
+                // B?t bit ?ánh d?u: Bây gi? ta b?t ??u r? sang nhánh ph?i
+                bit_stack |= mask;
+                
+                // ??c ch? s? nút con bên ph?i t? bmax.w (CPU ?ã tính tr??c kích th??c cây con trái)
+                int right_child_idx = int(bvh[(ind << 1) + 1].w); 
+                
+                prev_ind = ind;
+                ind = right_child_idx; // Quay xe b? lái sang nút con bên ph?i
+                current_depth++;
+                continue;
+            }
+        }
+
+        // N?u v?a t? con ph?i ?i lên (ho?c ?ã xong c? 2 con) -> Reset bit t?ng này và lùi ti?p lên cha cao h?n
+        bit_stack &= ~(1u << uint(current_depth)); 
+        prev_ind = ind;
+        ind = parent_idx; 
+        current_depth--;
+    }
+    
+    // K?t thúc vòng l?p Stackless, ki?m tra xem tia có trúng b?t k? tam giác nào không
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool hit_shadow_bitstack_pure(Ray r, float max_t)
+{
+    vec3 invdir = 1.0f / r.d;
+    const vec3 o = r.o;
+
+    // Bi?n bit duy nh?t qu?n lý toàn b? tr?ng thái cây, KHÔNG M?NG PH?
+    uint bit_stack = 0u; 
+    int current_depth = 0;
+
+    int ind = 0; // B?t ??u t? Root
+    int prev_ind = -1;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        
+        int range = int(bmax.w);
+        int parent_idx = int(bmin.w); // ??c con tr? cha t? c?u trúc b? nh?
+
+        // TR??NG H?P 1: ?I XU?NG CÂY (Duy?t t? trên xu?ng)
+        if (prev_ind == parent_idx || prev_ind == -1)
+        {
+            float tl, th;
+            th = hit_bbox7(o, bmin.xyz, bmax.xyz, invdir, tl);
+            bool hit = (max(tl, 0.0001f) <= min(th, max_t));
+
+            if (hit)
+            {
+                if (range == 0) // Nút trong
+                {
+                    prev_ind = ind;
+                    ind = ind + 1; // M?c ??nh lao xu?ng con bên trái theo c?u trúc DFS
+                    current_depth++;
+                    continue;
+                }
+                else // Nút lá
+                {
+                    int start = int(bmin.w); // N?u c?u trúc lá, ta nén start/range phù h?p
+                    int end   = start + range;
+                    for (int i = start; i < end; ++i) 
+                    {
+                        if (hitTriangleNoRec(r, i, max_t)) return true;
+                    }
+                }
+            }
+            // N?u tr??t h?p ho?c duy?t xong nút lá -> Chuy?n sang tr?ng thái l?i ng??c dòng (?i lên)
+            prev_ind = ind;
+            ind = parent_idx;
+            current_depth--;
+            continue;
+        }
+
+        // TR??NG H?P 2: L?I NG??C DÒNG LÊN TRÊN (Duy?t t? d??i lên)
+        // Xác ??nh xem ta v?a t? con trái ?i lên hay t? con ph?i ?i lên
+        int left_child_idx = ind + 1;
+        
+        // N?u v?a t? con trái ?i lên, ngh?a là còn con bên ph?i ch?a duy?t
+        if (prev_ind == left_child_idx)
+        {
+            // Ki?m tra tr?ng thái bit t?i t?ng này xem ?ã r? ph?i ch?a
+            uint mask = (1u << uint(current_depth));
+            if ((bit_stack & mask) == 0u)
+            {
+                // B?t bit lên ?ánh d?u: Bây gi? ta b?t ??u ?i vào nhánh ph?i
+                bit_stack |= mask;
+                
+                // Tính toán ch? s? nút con bên ph?i d?a trên kích th??c cây con trái ?ã ???c CPU tính tr??c
+                // ?? ??n gi?n và branchless, c?u trúc con ph?i có th? tra c?u nhanh:
+                int right_child_idx = int(bvh[(ind << 1) + 1].w); // (CPU l?u v? trí con ph?i vào bmax.w c?a nút trong)
+                
+                prev_ind = ind;
+                ind = right_child_idx; // R? sang con ph?i
+                current_depth++;
+                continue;
+            }
+        }
+
+        // N?u ?ã duy?t xong c? 2 con (ho?c v?a t? con ph?i ?i lên) -> Ti?p t?c lùi lên cha cao h?n
+        bit_stack &= ~(1u << uint(current_depth)); // Xóa bit t?ng này ?? reset cho l??t sau
+        prev_ind = ind;
+        ind = parent_idx; // Lên ti?p m?t t?ng cha n?a
+        current_depth--;
+    }
+    return false;
+}
+
+vec3 sample_light_position(int li)
+{
+    Light4 l = lights[li];
+    vec3 p = l.p.xyz;
+    vec3 u = l.u.xyz;
+    vec3 v = l.v.xyz;
+    float s = sqrt(rand());
+    float b0 = 1.0f - s;
+    float b1 = rand() * s;
+    return p + b0 * u + b1 * v;
+}
+
+vec3 path_trace(inout Ray r)
+{
+	vec3 L = vec3(0.0f);
+	vec3 T = vec3(1.0f);
+
+	float prev_pdf = 1.0f;
+
+
+	//Ray new_ray = r;
+	bool is_specular = true;
+
+	for(int i = 0; i < 3; ++i)
+	{
+        if (i > 1)
+	    {
+	        // Max throughput component determines survival probability
+			float p = max(T.x, max(T.y, T.z));
+			
+			// Cap the survival probability to prevent infinite energy variance
+			if (p > 0.95f) p = 0.95f; 
+
+			// Use your rand() function to evaluate Russian Roulette condition
+			if (rand() > p)
+			{
+		        break; // Terminate the ray path early
+			}
+
+			// Unbias the throughput vector with the survival probability
+			T /= p; 
+		}
+		HitRecord rec;
+		
+        if(trace_bvh_bitstack_pure(r, rec))
+		//if(trace_bvh_dfs(r, rec))
+        //if(trace_bvh_stackless(r, rec))
+		{
+			float cos_incident = dot(r.d, rec.n);
+
+			vec3 original_n = rec.n;
+
+			if (cos_incident > 0)
+					rec.n = -rec.n;
+
+			vec4 emission = rec.emission;
+
+			if(emission.w != -1)
+			{
+				if(is_specular)
+				{
+					L += T * emission.xyz;
+					return L;
+				}
+				else
+				{
+					vec3 light_direction = r.d * rec.t;
+
+					float length = length(light_direction);
+
+					light_direction = normalize(light_direction);
+
+					float cos_light = (-dot(light_direction, rec.n));//ko can abs
+
+					float length2 = length * length;
+
+					int light_index = int(emission.w);//int(vt.w);
+
+					
+					Light4 l = lights[light_index];
+					vec3 light_area_pdf = l.area_pdf.xyz;
+					
+					float pdf_light = length2 / (light_area_pdf.x * cos_light) * light_area_pdf.y;
+					float mis_weight = power_heuristic(prev_pdf, pdf_light);
+
+					
+					L += T * emission.xyz * mis_weight;
+
+					return L;
+				}
+			}
+
+			vec3 hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+
+            vec4 specular = rec.specular;
+
+			if(specular.w == 0)
+			{
+				int light_index = int(rand() * numLights);
+				
+				vec3 light_position = sample_light_position(light_index);
+
+				vec3 light_direction = light_position - hit_point;
+
+				float length = length(light_direction);
+
+				float ilength = 1.0f / length;
+
+				light_direction *= ilength;
+
+				float cos_mtl = dot(light_direction, original_n);
+
+				//float cos_light = dot(light_direction, rec.n);
+
+				Ray light_ray = Ray(hit_point, light_direction);
+
+				Light4 l = lights[light_index];
+
+				vec3 light_normal = l.n.xyz;
+				
+				float cos_light = ((dot(light_direction, light_normal)));
+
+                if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_bitstack_pure(light_ray, length))
+                //if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_dfs(light_ray, length))
+				//if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_stackless(light_ray, length))
+
+                //if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_bitstack(light_ray, length))
+                //if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_bitstack_fixed(light_ray, length))
+				{	
+					Light4 l = lights[light_index];
+					
+					vec3 light_emission = l.e.xyz;
+					
+					vec3 light_area_pdf = l.area_pdf.xyz;
+					
+					float pdf_light = (length * length) / (light_area_pdf.x * -cos_light) * light_area_pdf.y;
+
+					vec3 bsdf_eval = diffuse_bsdf(r, rec, light_direction);
+
+					float bsdf_pdf = diffuse_pdf(r, rec, light_direction);
+
+					float mis_weight = power_heuristic(pdf_light, bsdf_pdf);
+
+					L += T * light_emission * bsdf_eval * mis_weight / pdf_light;
+					
+				}
+			}
+
+			//Sample for new ray
+			vec3 sample_direction = diffuse_sample(r, rec.n);
+			vec3 new_hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+
+			vec3 sample_eval = diffuse_bsdf(r, rec, sample_direction);
+
+			float bsdf_pdf = diffuse_pdf(r, rec, sample_direction);
+
+            //no russian roulette
+			T *= sample_eval;
+
+            float energy = max(T.x, max(T.y, T.z));
+            if (energy < 0.01f) 
+            {
+                break; 
+            }
+               
+
+			prev_pdf = bsdf_pdf;
+
+			is_specular = false;
+
+			r.o = new_hit_point;
+			r.d = sample_direction;
+
+			//r = Ray(new_hit_point, sample_direction);
+		}
+		else
+			return L;
+	}
+	return L;
+}
+
+float halton(int index, int b) {
+    float result = 0.0;
+    float f = 1.0 / float(b);
+    int i = index;
+    while (i > 0) {
+        result += f * float(i % b);
+        i /= b;
+        f /= float(b);
+    }
+    return result;
+}
+
+float pcg_rand(inout uint seed) 
+{
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    seed = (word >> 22u) ^ word;
+    return float(seed) * (1.0f / 4294967295.0f);
+}
+
+float radical_inverse_base2(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10f; // / 0xffffffff
+}
+
+float radical_inverse_base3(uint n) {
+    float val = 0.0f;
+    float invBase = 1.0f / 3.0f;
+    float invBi = invBase;
+    while (n > 0u) {
+        uint d_i = n % 3u;
+        val += float(d_i) * invBi;
+        invBi *= invBase;
+        n /= 3u;
+    }
+    return val;
+}
+
+void main_test()
+{
+
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoords.x >= int(screenResolution.x) || pixelCoords.y >= int(screenResolution.y)) 
+    {
+        return;
+    }
+
+     vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+
+	//seed = gl_FragCoord.xy;
+    //seed = vec2(pixelCoords); 
+
+    //normal
+	float r1 = 2.0f * rand();
+	float r2 = 2.0f * rand();
+    
+    //good halton
+     // Get absolute pixel coordinates in Compute Shader
+     /*
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    
+    // Safety exit if invocation falls outside viewport boundaries (e.g. 700x700)
+   // if (x >= 700 || y >= 700) return;
+
+    // Initialize deterministic seed per pixel and per frame
+    uint seed = x * 1973u + y * 9277u + currentFrameSample * 26699u;
+
+    // Generate non-clumping white noise values between 0.0 and 2.0
+    float r1 = 2.0f * pcg_rand(seed);
+    float r2 = 2.0f * pcg_rand(seed);
+    */
+
+    //uint pixel_hash = x * 1973u + y * 9277u + frame_index * 26699u;
+    
+    //uint scrambled_index = sample_index + pixel_hash;
+
+   /* uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+
+    uint pixel_hash = x * 1973u + y * 9277u + currentFrameSample * 26699u;
+    
+    uint scrambled_index = currentFrameSample + pixel_hash;
+
+    float r1 = 2.0f * radical_inverse_base2(scrambled_index);
+    float r2 = 2.0f * radical_inverse_base3(scrambled_index);*/
+
+
+    // Generate your two random numbers between 0.0 and 2.0
+    //float r1 = 2.0f * pcg_rand(seed);
+    //float r2 = 2.0f * pcg_rand(seed);
+
+    //halton
+    /*float pixel_noise_x = rand();
+    float pixel_noise_y = rand();
+
+	int sampleIndex = currentFrameSample; 
+
+    float h1  = 2.0f * halton(sampleIndex, 2);
+    float h2 = 2.0f * halton(sampleIndex, 3);
+
+	float r1 = fract(h1 + pixel_noise_x) * 2.0f;
+    float r2 = fract(h2 + pixel_noise_y) * 2.0f;*/
+
+
+	vec2 jitter;
+
+	jitter.x = r1 < 1.0 ? sqrt(r1) - 1.0f : 1.0f - sqrt(2.0f - r1);
+	jitter.y = r2 < 1.0 ? sqrt(r2) - 1.0f : 1.0f - sqrt(2.0f - r2);
+	jitter /= (screenResolution * 0.5f);
+
+	//vec2 d = (2.0f * tex - 1.0f) + jitter;
+    vec2 d = (2.0f * texCoords - 1.0f) + jitter;
+
+	float tan_fov = tan(camera.fov * 0.5f);
+	d.x *= tan_fov;//screenResolution.x / screenResolution.y * tan_fov;
+	d.y *= tan_fov;
+
+	vec3 rayDir = normalize(d.x * camera.right + d.y * camera.up + camera.forward);
+
+	Ray ray = Ray(camera.position, rayDir);
+
+	vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+    //vec3 accumulate_color = imageLoad(img_output, pixelCoords).xyz;
+
+
+	vec3 pixelColor = path_trace(ray);
+
+	//vec3 pixelColor = vec3(0,1,1);
+
+	//color = pixelColor + accumulate_color;
+
+    imageStore(img_output, pixelCoords, vec4(pixelColor + accumulate_color, 1.0f));
+
+}
+
+void main()
+{
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoords.x >= int(screenResolution.x) || pixelCoords.y >= int(screenResolution.y)) 
+    {
+        return;
+    }
+
+    vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+	
+    seed = texCoords;
+
+    //normal
+	float r1 = 2.0f * rand();
+	float r2 = 2.0f * rand();
+
+    /*uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    
+   
+    // Initialize deterministic seed per pixel and per frame
+    uint seed = x * 1973u + y * 9277u + currentFrameSample * 26699u;
+
+    // Generate non-clumping white noise values between 0.0 and 2.0
+    float r1 = 2.0f * pcg_rand(seed);
+    float r2 = 2.0f * pcg_rand(seed);*/
+
+	vec2 jitter;
+
+	jitter.x = r1 < 1.0 ? sqrt(r1) - 1.0f : 1.0f - sqrt(2.0f - r1);
+	jitter.y = r2 < 1.0 ? sqrt(r2) - 1.0f : 1.0f - sqrt(2.0f - r2);
+	jitter /= (screenResolution * 0.5f);
+
+	//vec2 d = (2.0f * tex - 1.0f) + jitter;
+    vec2 d = (2.0f * texCoords - 1.0f) + jitter;
+
+	float tan_fov = tan(camera.fov * 0.5f);
+	d.x *= tan_fov;//screenResolution.x / screenResolution.y * tan_fov;
+	d.y *= tan_fov;
+
+	vec3 rayDir = normalize(d.x * camera.right + d.y * camera.up + camera.forward);
+
+	Ray ray = Ray(camera.position, rayDir);
+
+	vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+    //vec3 accumulate_color = imageLoad(img_output, pixelCoords).xyz;
+
+
+	vec3 pixelColor = path_trace(ray);
+
+	//vec3 pixelColor = vec3(0,1,1);
+
+	//color = pixelColor + accumulate_color;
+
+    imageStore(img_output, pixelCoords, vec4(pixelColor + accumulate_color, 1.0f));
+
+}

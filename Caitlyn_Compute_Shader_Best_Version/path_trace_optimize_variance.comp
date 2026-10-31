@@ -1,0 +1,2065 @@
+#version 460 core
+
+//best file!!
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uniform int tree_height;
+int bvh_height = tree_height;
+uniform int currentFrameSample;
+
+//#define VARIANCE_THRESHOLD 0.00005f 
+
+//#define MIN_SAMPLES 16
+
+#define VARIANCE_THRESHOLD 0.0002f 
+
+#define MIN_SAMPLES 8
+
+shared bool shared_workgroup_active;
+
+layout(std430, binding = 1) restrict readonly buffer vertices_buf
+{
+    vec4 vertices[];
+};
+
+layout(std430, binding = 2) buffer normals_buf
+{
+    vec4 normals[];
+};
+
+layout(std430, binding = 3) buffer texcoords_buf
+{
+    vec2 texcoords[];
+};
+
+layout(std430, binding = 4) restrict readonly buffer triangles_buf
+{
+    ivec4 triangles[];
+};
+
+layout(std430, binding = 5) buffer mats_buf
+{
+    vec4 materials[];
+};
+
+struct Light4
+{
+    vec4 p;
+    vec4 u;
+    vec4 v;
+    vec4 e;
+    vec4 n;
+    vec4 area_pdf;
+};
+
+layout(std430, binding = 6) buffer light_buf
+{
+    Light4 lights[];
+};
+
+layout(std430, binding = 7) readonly buffer bvh_buf
+{
+    vec4 bvh[];
+};
+
+layout(binding = 8) uniform sampler2DArray albedo_textures;
+
+layout(rgba32f, binding = 9) uniform image2D img_output;
+
+layout(binding = 10) uniform sampler2D accumulate_tex;
+
+layout(rgba32f, binding = 11) uniform image2D variance_history_tex;
+
+#define pi 3.1415926
+#define pi2 6.2831853
+#define ipi 1.0f / pi
+
+struct Ray { vec3 o; vec3 d; };
+struct Camera { vec3 up; vec3 right; vec3 forward; vec3 position; float fov; float focalDist; float aperture; };
+
+vec2 seed;
+
+uniform Camera camera;
+uniform vec2 screenResolution;
+uniform vec2 randomVector;
+uniform int numLights;
+
+#define inf 1e9
+#define eps 1e-4f
+
+float rand()
+{
+    seed -= vec2(randomVector.x * randomVector.y);
+    uint state = floatBitsToUint(seed.x * 1234567.0 + seed.y * 7654321.0);
+    return fract(sin(dot(seed, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void onb(in vec3 n, out vec3 b1, out vec3 b2)
+{
+    if (n.z < -0.999f) {
+        b1 = vec3(0, -1, 0);
+        b2 = vec3(-1, 0, 0);
+    } else {
+        float a = 1.0 / (1.0 + n.z);
+        float b = -n.x * n.y * a;
+        b1 = vec3(1.0 + b, b, -n.x);
+        b2 = vec3(b, 1.0 + b, -n.y);
+    }
+}
+
+struct HitRecord
+{
+    vec4 albedo;  
+    vec4 emission;
+    vec4 specular;
+    vec4 tex_ind;
+    vec3 n;
+    vec2 texcoord;
+    float u;
+    float v;
+    float t;
+    int triangle_ind;
+    int mtl_ind;
+};
+
+float power_heuristic(float a, float b)
+{
+    float t = a * a;
+    return t / (b * b + t);
+}
+
+float power_heuristic_divide(float a, float b)
+{
+    return a / (b * b + a * a);
+}
+
+vec3 cosine_hemisphere_sampling()
+{
+    float u1 = rand();
+    float u2 = rand();
+    float r = sqrt(u1);
+    float phi = pi2 * u2;
+    return vec3(r * cos(phi), r * sin(phi), sqrt(1.0f - u1));
+}
+
+vec3 diffuse_sample(in Ray r, vec3 n)
+{
+    vec3 u, v;
+    onb(n, u, v);
+    vec3 dir = cosine_hemisphere_sampling();
+    dir = u * dir.x + v * dir.y + n * dir.z;
+    return dir;
+}
+
+float diffuse_pdf(Ray r, inout HitRecord rec, in vec3 sample_direction)
+{
+    float cos = dot(sample_direction, rec.n);
+    return cos * ipi;
+}
+
+vec3 diffuse_bsdf(Ray r, inout HitRecord rec, in vec3 sample_direction)
+{
+    return rec.albedo.xyz;
+} 
+
+vec2 interpolate(vec2 a, vec2 b, vec2 c, float u, float v) { return a * (1.0f - u - v) + b * u + c * v; }
+vec3 interpolate(vec3 a, vec3 b, vec3 c, float u, float v) { return a * (1.0f - u - v) + b * u + c * v; }
+
+
+float hit_bbox(Ray r, vec3 bmin, vec3 bmax, vec3 invdir, out float tl)
+{
+    vec3 t1 = (bmin - r.o) * invdir;
+    vec3 t2 = (bmax - r.o) * invdir;
+    
+    vec3 tmin = min(t1, t2);
+    vec3 tmax = max(t1, t2);
+    
+    tl = max(tmin.x, max(tmin.y, tmin.z));
+    float th = min(tmax.x, min(tmax.y, tmax.z));
+    return th; 
+}
+
+
+ivec3 get_ray_sign(vec3 invdir) 
+{
+    return ivec3(lessThan(invdir, vec3(0.0)));
+}
+
+
+//best
+float hit_bbox4(Ray r, vec3 bmin, vec3 bmax, vec3 invdir, out float tl)
+{
+    /*bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    vec3 t1 = mix(bmax, bmin, is_pos) - r.o; 
+    vec3 t2 = mix(bmin, bmax, is_pos) - r.o;
+
+    //vec3 t2 = (bmin + bmax) - 2 * r.o - t1;
+    
+
+    //t1 = (t1 - r.o) * invdir;
+    //t2 = (t2 - r.o) * invdir;
+
+    //co
+    //X = a * (1 - x) + b * x = a + x * (b - a)
+
+    //can
+    //Y = a * x + b * (1 - x) = b  + x * (a - b)
+
+    //Y = -(X - a) + b
+
+    //t2 = -t1 + (b + a)
+
+
+    t1 *= invdir;
+    t2 *= invdir;
+
+    tl = max(max(t1.x, t1.y), t1.z);
+    return min(min(t2.x, t2.y), t2.z);*/
+
+     // T?i ?u b?ng cách nhân phân ph?i invdir vào tr??c
+    vec3 tbot = (bmin - r.o) * invdir;
+    vec3 ttop = (bmax - r.o) * invdir;
+
+    // GPU c?c k? m?nh trong vi?c tìm min/max c?a 2 vector
+    vec3 tmin = min(tbot, ttop);
+    vec3 tmax = max(ttop, tbot);
+
+    // Tìm kho?ng giao nhau
+   // tl = max(max(tmin.x, tmin.y), tmin.z);
+   // float th = min(min(tmax.x, tmax.y), tmax.z);
+
+    tl = max(tmin.x, max(tmin.y, tmin.z));
+    float th = min(tmax.x, min(tmax.y, tmax.z));
+    return th;
+}
+
+bool hit_bbox4b(Ray r, vec3 bmin, vec3 bmax, vec3 invdir, out float tl, float t)
+{
+    // T?i ?u b?ng cách nhân phân ph?i invdir vào tr??c
+    vec3 tbot = (bmin - r.o) * invdir;
+    vec3 ttop = (bmax - r.o) * invdir;
+
+    // GPU c?c k? m?nh trong vi?c tìm min/max c?a 2 vector
+    vec3 tmin = min(tbot, ttop);
+    vec3 tmax = max(ttop, tbot);
+
+    // Tìm kho?ng giao nhau
+    tl = max(max(tmin.x, tmin.y), tmin.z);
+    float th = min(min(tmax.x, tmax.y), tmax.z);
+
+    return (th >= 0 && tl <= th && tl < t);
+}
+
+//best
+float hit_bbox42(Ray r, vec3 bmin, vec3 bmax, vec3 invdir,  bvec3 is_pos, out float tl)
+{  
+    vec3 t1 = mix(bmax, bmin, is_pos) - r.o; 
+    vec3 t2 = mix(bmin, bmax, is_pos) - r.o;
+   
+    t1 *= invdir;
+    t2 *= invdir;
+
+    tl = max(max(t1.x, t1.y), t1.z);
+    return min(min(t2.x, t2.y), t2.z);
+}
+
+bool hit_bbox42b(Ray r, vec3 bmin, vec3 bmax, vec3 invdir,  bvec3 is_pos, out float tl, float t)
+{  
+    vec3 t1 = mix(bmax, bmin, is_pos) - r.o; 
+    vec3 t2 = mix(bmin, bmax, is_pos) - r.o;
+   
+    t1 *= invdir;
+    t2 *= invdir;
+
+    tl = max(max(t1.x, t1.y), t1.z);
+    float th = min(min(t2.x, t2.y), t2.z);
+
+    return (th >= 0 && tl <= th && tl < t);
+}
+
+float hit_bbox43(vec3 bmin, vec3 bmax, vec3 invdir, vec3 oinvd, bvec3 is_pos, out float tl)
+{  
+    /*vec3 t1 = mix(bmax, bmin, is_pos) * invdir + oinvd; 
+    vec3 t2 = mix(bmin, bmax, is_pos) * invdir + oinvd;
+   
+    //t1 *= invdir;
+    //t2 *= invdir;
+
+    tl = max(max(t1.x, t1.y), t1.z);
+    return min(min(t2.x, t2.y), t2.z);*/
+
+    vec3 t1 = mix(bmax, bmin, is_pos) * invdir + oinvd; 
+    vec3 t2 = mix(bmin, bmax, is_pos) * invdir + oinvd;
+   
+    // B?T BU?C PH?I CÓ: S?a l?i d?u do mix và invdir ép sai h??ng
+    vec3 tmin = min(t1, t2);
+    vec3 tmax = max(t1, t2);
+
+    tl = max(max(tmin.x, tmin.y), tmin.z);
+    return min(min(tmax.x, tmax.y), tmax.z);
+}
+
+float hit_bbox44(vec3 bmin, vec3 bmax, vec3 invdir, vec3 oinvd, out float tl)
+{
+    // T?i ?u b?ng cách nhân phân ph?i invdir vào tr??c
+    vec3 tbot = bmin * invdir - oinvd;
+    vec3 ttop = bmax * invdir - oinvd;
+
+    // GPU c?c k? m?nh trong vi?c tìm min/max c?a 2 vector
+    vec3 tmin = min(tbot, ttop);
+    vec3 tmax = max(ttop, tbot);
+
+    // Tìm kho?ng giao nhau
+    tl = max(max(tmin.x, tmin.y), tmin.z);
+    float th = min(min(tmax.x, tmax.y), tmax.z);
+
+    return th;
+}
+
+bool hit_bbox4_prune(Ray r, vec3 bmin, vec3 bmax, vec3 invdir, float t, out float tl)
+{
+    bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    vec3 t1 = mix(bmax, bmin, is_pos);
+    t1 = (t1 - r.o) * invdir;
+    tl = max(max(t1.x, t1.y), t1.z);
+
+    if(tl >= t)
+        return false;
+
+    vec3 t2 = mix(bmin, bmax, is_pos);
+    t2 = (t2 - r.o) * invdir;
+
+    float th = min(min(t2.x, t2.y), t2.z);
+
+    return (th >= 0) && (th >= tl);// && 
+}
+
+// --- HÀM TÍNH GIAO C?T SONG SONG 2 H?P CON (G?P ALU) ---
+// Tính toán ??ng th?i kho?ng cách tl1, th1, tl2, th2 ch? b?ng các toán t? vector
+void hit_double_bbox(Ray r, vec3 invdir, 
+                     vec3 bmin1, vec3 bmax1, 
+                     vec3 bmin2, vec3 bmax2, 
+                     out float tl1, out float th1, 
+                     out float tl2, out float th2)
+{
+    bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    // Ch?n min/max cho h?p 1
+    vec3 t1_box1 = mix(bmax1, bmin1, is_pos);
+    vec3 t2_box1 = mix(bmin1, bmax1, is_pos);
+    t1_box1 = (t1_box1 - r.o) * invdir;
+    t2_box1 = (t2_box1 - r.o) * invdir;
+
+    // Ch?n min/max cho h?p 2 (GPU s? ch?y song song lu?ng này v?i h?p 1)
+    vec3 t1_box2 = mix(bmax2, bmin2, is_pos);
+    vec3 t2_box2 = mix(bmin2, bmax2, is_pos);
+    t1_box2 = (t1_box2 - r.o) * invdir;
+    t2_box2 = (t2_box2 - r.o) * invdir;
+
+    // Gom l?nh max/min ph?n c?ng
+    tl1 = max(max(t1_box1.x, t1_box1.y), t1_box1.z);
+    th1 = min(min(t2_box1.x, t2_box1.y), t2_box1.z);
+
+    tl2 = max(max(t1_box2.x, t1_box2.y), t1_box2.z);
+    th2 = min(min(t2_box2.x, t2_box2.y), t2_box2.z);
+}
+
+bool hit_triangle(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = vec3(
+        r.d.y * v2.z - r.d.z * v2.y,
+        r.d.z * v2.x - r.d.x * v2.z,
+        r.d.x * v2.y - r.d.y * v2.x
+    );
+
+    vec3 tv = r.o - v0;
+    vec3 qv = vec3(
+        tv.y * v1.z - tv.z * v1.y,
+        tv.z * v1.x - tv.x * v1.z,
+        tv.x * v1.y - tv.y * v1.x
+    );
+
+    vec4 uvt;
+    uvt.x = dot(tv, pv);
+    uvt.y = dot(r.d, qv);
+    uvt.z = dot(v2, qv);
+    float inv_det = 1.0f / dot(v1, pv);
+
+    uvt.xyz = uvt.xyz * inv_det;
+    uvt.w = 1.0 - uvt.x - uvt.y;
+    
+    if (all(greaterThanEqual(uvt, vec4(0.0f))) && uvt.z < t)
+    {
+        t = uvt.z;
+        rec.u = uvt.x;
+        rec.v = uvt.y;
+        rec.triangle_ind = i;
+        rec.mtl_ind = (triIndex.w);
+        return true;
+    }   
+    return false;
+}
+
+bool hit_triangle2(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = -vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz + v0;
+    vec3 v2 = vertices[triIndex.z].xyz + v0;
+
+    vec3 pv = cross(r.d, v2);
+    float det = dot(v1, pv);
+
+    //front face only
+    // if 2 face use abs(det)
+    if (abs(det) < 1e-6) return false;
+    float inv_det = 1.0f / det;
+
+    vec3 tv = r.o + v0;
+    float u = dot(tv, pv) * inv_det;
+    if (u < 0.0 || u > 1.0 ) return false;
+
+    vec3 qv = cross(tv, v1);
+    float v = dot(r.d, qv) * inv_det;
+    if (v < 0.0 || v > 1.0 || u + v > 1.0) return false;
+
+    float t_hit = dot(v2, qv) * inv_det;
+    
+    if (t_hit > 0.0 && t_hit < t)
+    {
+        t = t_hit;
+        rec.u = u;
+        rec.v = v;
+        rec.triangle_ind = i;
+        rec.mtl_ind = triIndex.w;
+        return true;
+    }   
+    return false;
+}
+//fail!
+bool hit_triangle_branchless(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = cross(r.d, v2);
+    float det = dot(v1, pv);
+
+    // V?n gi? l?i check det ?? tránh chia cho 0 (Hàm ph?n c?ng t?i ?u r?t t?t l?nh ??n này)
+    if (abs(det) < 1e-6) return false;
+    float inv_det = 1.0f / det;
+
+    vec3 tv = r.o - v0;
+    float u = dot(tv, pv) * inv_det;
+
+    vec3 qv = cross(tv, v1);
+    float v = dot(r.d, qv) * inv_det;
+    float t_hit = dot(v2, qv) * inv_det;
+
+    // --- T?I ?U GOM M?NG ?I?U KI?N KHÔNG R? NHÁNH ---
+    vec4 check;
+    check.x = u;                 // u >= 0.0
+    check.y = v;                 // v >= 0.0
+    check.z = 1.0f - (u + v);    // u + v <= 1.0 -> (1.0 - u - v) >= 0.0
+    check.w = t_hit;             // t_hit > 0.0001f (Tránh shadow acne / t? va ch?m)
+
+    // Ki?m tra ??ng th?i toàn b? ranh gi?i barycentric và kho?ng cách t hi?n t?i
+    if (all(greaterThanEqual(check, vec4(0.0001f))) && t_hit < t)
+    {
+        t = t_hit;
+        rec.u = u;
+        rec.v = v;
+        rec.triangle_ind = i;
+        rec.mtl_ind = triIndex.w;
+        return true;
+    }   
+    return false;
+}
+
+bool hit_triangle_woop(Ray r, int i, inout HitRecord rec, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz; 
+    vec3 v1 = vertices[triIndex.y].xyz;
+    vec3 v2 = vertices[triIndex.z].xyz;
+
+    // 1. Xác ??nh tr?c chi?m ?u th? (Dominant Axis) c?a h??ng tia
+    // (M?o: Có th? tính s?n kz, kx, ky ngoài vòng l?p và truy?n vào làm uniform/bi?n c?c b? ?? t?ng t?c h?n n?a!)
+    vec3 abs_d = abs(r.d);
+    int kz = (abs_d.x > abs_d.y) ? ((abs_d.x > abs_d.z) ? 0 : 2) : ((abs_d.y > abs_d.z) ? 1 : 2);
+    int kx = (kz + 1 == 3) ? 0 : kz + 1;
+    int ky = (kx + 1 == 3) ? 0 : kx + 1;
+
+    // Hoán ??i h??ng n?u h??ng tia b? âm ?? gi? v?ng th? t? bao quanh (Winding Order)
+    if (r.d[kz] < 0.0f) {
+        int tmp = kx; kx = ky; ky = tmp;
+    }
+
+    // 2. Tính h?ng s? bi?n ??i tr??t (Shear Constants)
+    float inv_d_kz = 1.0f / r.d[kz];
+    float sx = r.d[kx] * inv_d_kz;
+    float sy = r.d[ky] * inv_d_kz;
+    float sz = inv_d_kz;
+
+    // 3. T?nh ti?n các ??nh tam giác t??ng ??i v?i g?c tia
+    vec3 p0 = v0 - r.o;
+    vec3 p1 = v1 - r.o;
+    vec3 p2 = v2 - r.o;
+
+    // Chi chi?u 3D sang không gian tr??t 2D
+    float p0x = p0[kx] - sx * p0[kz];
+    float p0y = p0[ky] - sy * p0[kz];
+    float p1x = p1[kx] - sx * p1[kz];
+    float p1y = p1[ky] - sy * p1[kz];
+    float p2x = p2[kx] - sx * p2[kz];
+    float p2y = p2[ky] - sy * p2[kz];
+
+    // 4. Tính toán hàm C?nh 2D (Edge Functions) ??i di?n cho t?a ?? Barycentric ch?a chu?n hóa
+    float u = p2x * p1y - p2y * p1x;
+    float v = p0x * p2y - p0y * p2x;
+    float w = p1x * p0y - p1y * p0x;
+
+    // Ki?m tra d?u s?m: N?u các hàm c?nh không ??ng d?u, tia n?m ngoài tam giác -> Tr??t!
+    if ((u < 0.0f || v < 0.0f || w < 0.0f) && (u > 0.0f || v > 0.0f || w > 0.0f)) {
+        return false;
+    }
+
+    // Tính ??nh th?c chu?n hóa
+    float det = u + v + w;
+    if (det == 0.0f) return false;
+    float inv_det = 1.0f / det;
+
+    // 5. Tính toán kho?ng cách giao c?t tHit d?c theo tr?c chính
+    float t_hit = (u * p0[kz] + v * p1[kz] + w * p2[kz]) * sz * inv_det;
+
+    // Ki?m tra ranh gi?i kho?ng cách h?p l?
+    if (t_hit > 0.0001f && t_hit < t)
+    {
+        t = t_hit;
+        // Chu?n hóa t?a ?? Barycentric th?c t? ?? tr? v? ph?c v? n?i suy VN/VT
+        rec.u = u * inv_det;
+        rec.v = v * inv_det;
+        rec.triangle_ind = i;
+        rec.mtl_ind = triIndex.w;
+        return true;
+    }
+
+    return false;
+}
+
+//best
+bool hitTriangleNoRec(in Ray r, int i, inout float t)
+{
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz;
+    vec3 v1 = vertices[triIndex.y].xyz - v0;
+    vec3 v2 = vertices[triIndex.z].xyz - v0;
+
+    vec3 pv = vec3(
+        r.d.y * v2.z - r.d.z * v2.y,
+        r.d.z * v2.x - r.d.x * v2.z,
+        r.d.x * v2.y - r.d.y * v2.x
+    );
+
+    //vec3 pv = cross(r.d, v2);
+
+    float det = v1.x * pv.x + v1.y * pv.y + v1.z * pv.z;
+    if (abs(det) < 1e-6) return false;
+    //if (det == 0.0) return false;
+
+    float inv_det = 1.0 / det;
+    vec3 tv = r.o - v0;
+
+    float u = (tv.x * pv.x + tv.y * pv.y + tv.z * pv.z) * inv_det;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qv = vec3(
+        tv.y * v1.z - tv.z * v1.y,
+        tv.z * v1.x - tv.x * v1.z,
+        tv.x * v1.y - tv.y * v1.x
+    );
+
+    float v = (r.d.x * qv.x + r.d.y * qv.y + r.d.z * qv.z) * inv_det;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float tHit = (v2.x * qv.x + v2.y * qv.y + v2.z * qv.z) * inv_det;
+    if (tHit <= 0.0 || tHit >= t) return false;
+
+    return true;
+}
+
+void compute_normal_texcoord_and_material(inout HitRecord rec)
+{
+    int triangle_ind = rec.triangle_ind;
+    int mtl_ind = (rec.mtl_ind);
+    ivec4 vn = triangles[3 * triangle_ind + 1];
+    
+    if (vn.w == 0)
+        rec.n = vn.xyz;
+    else
+    {
+        vec3 vn0 = normals[vn.x].xyz;
+        vec3 vn1 = normals[vn.y].xyz;
+        vec3 vn2 = normals[vn.z].xyz;
+        rec.n = interpolate(vn0, vn1, vn2, rec.u, rec.v);
+    }
+    
+    rec.tex_ind = materials[4 * mtl_ind + 3];
+    rec.emission = materials[4 * mtl_ind + 1];
+    rec.specular = materials[4 * mtl_ind + 2];
+
+    if (rec.tex_ind.x != -1)
+    {
+        ivec4 vt = triangles[3 * triangle_ind + 2];
+        vec2 vt0 = texcoords[vt.x].xy;
+        vec2 vt1 = texcoords[vt.y].xy;
+        vec2 vt2 = texcoords[vt.z].xy;
+        rec.texcoord = interpolate(vt0, vt1, vt2, rec.u, rec.v);
+        rec.albedo = texture(albedo_textures, vec3(rec.texcoord, rec.tex_ind.x));
+    }
+    else
+        rec.albedo = materials[4 * mtl_ind];
+}
+
+bool trace_bvh_dfs_vectorized(Ray r, out HitRecord rec)
+{
+    int stk[32]; 
+    int ptr = 0;
+    float t = inf;
+    const vec3 invdir = 1.0f / (r.d);
+   
+    int ind = 0;
+    
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+            
+            // THAY TH?: G?i 1 hàm g?p duy nh?t, tri?t tiêu vi?c g?i hàm và ép xung ALU ph?n c?ng
+            hit_double_bbox(r, invdir, 
+                            bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz,
+                            bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz,
+                            tl1, th1, tl2, th2);
+
+            bool left  = (tl1 <= th1) && (th1 > 0.0f) && (tl1 < t);
+            bool right = (tl2 <= th2) && (th2 > 0.0f) && (tl2 < t);
+
+            if (left && right)
+            {
+                if (tl1 < tl2) { stk[ptr++] = rightIndex; ind = leftIndex; }
+                else { stk[ptr++] = leftIndex; ind = rightIndex; }
+                continue;
+            }
+            else if (left)  { ind = leftIndex;  continue; }
+            else if (right) { ind = rightIndex; continue; }
+        }   
+        else 
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = end - 1; i >= start; --i) 
+            { 
+                // Gi? nguyên hàm chu?n hit_triangle2 ch?y ngon nh?t c?a bác
+                hit_triangle2(r, i, rec, t); 
+            }
+        }
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool trace_bvh_dfs(Ray r, out HitRecord rec)
+{
+    int stk[32]; 
+    int ptr = 0;
+    float t = inf;
+    const vec3 invdir = 1.0f / (r.d);
+    const vec3 oinvd = r.o * invdir;
+    //const bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    int ind = 0;
+    
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+
+            //float tl1, tl2;
+           
+            //best
+            th1 = hit_bbox4(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, tl1);
+            th2 = hit_bbox4(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+            
+            //th1 = hit_bbox42(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, is_pos, tl1);
+            //th2 = hit_bbox42(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, is_pos, tl2);
+
+            //th1 = hit_bbox43(bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, oinvd, is_pos, tl1);
+            //th2 = hit_bbox43(bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, oinvd, is_pos, tl2);
+
+            //th1 = hit_bbox44(bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, oinvd, tl1);
+            //th2 = hit_bbox44(bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, oinvd, tl2);
+
+            //best
+            bool left  = (tl1 <= th1) && (th1 > 0.0f) && (tl1 < t);
+            bool right = (tl2 <= th2) && (th2 > 0.0f) && (tl2 < t);
+            
+            //bool left = hit_bbox4b(r, bvh[leftIndex * 2].xyz, bvh[leftIndex * 2 + 1].xyz, invdir, tl1, t);
+            //bool right = hit_bbox4b(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2, t);
+
+
+            /*float tl1, tl2;
+            
+            bool left  = hit_bbox4_prune(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, t, tl1);
+            bool right = hit_bbox4_prune(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, t, tl2);
+            */
+            
+            //hai ham trace bvh voi trace shadow lai doi hoi kieu logic khac nhau de chay nhanh
+            if (left && right)
+            {
+                //if (tl1 < tl2) { stk[ptr++] = rightIndex; ind = leftIndex; }
+                //else { stk[ptr++] = leftIndex; ind = rightIndex; }
+
+                //int first  = choose_left ? leftIndex : rightIndex;
+                //int second = choose_left ? rightIndex : leftIndex;
+
+                //stk[ptr++] = second; 
+                //ind = first; 
+
+                if(tl1 < tl2)
+                {
+                    stk[ptr++] = rightIndex; 
+                    ind = leftIndex;
+                    continue;
+                }
+
+                stk[ptr++] = leftIndex; 
+                ind = rightIndex;  
+                continue;
+            }
+            else if (left) { ind = leftIndex; continue; }          
+            else if (right) { ind = rightIndex; continue; }
+        }   
+        else 
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = end - 1; i >= start; --i) 
+            { 
+                hit_triangle2(r, i, rec, t); 
+            }
+        }
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool trace_bvh_dfs_bitstack(Ray r, out HitRecord rec)
+{
+    float t = inf;
+    const vec3 invdir = 1.0f / (r.d);
+
+    // --- KH?I T?O BIT-STACK SIÊU NH? (THAY TH? HOÀN TOÀN M?NG STK[32]) ---
+    // Ch? t?n ?úng 4 bytes thanh ghi duy nh?t, gi?i phóng 100% dung l??ng ph?n c?ng
+    uint bit_stk = 0u; 
+    
+    // M?ng l?u v?t l?ch s? ID d?c theo ?? sâu cây ?? ph?c v? vi?c quay ng??c (Backtracking)
+    // Cây cao t?i ?a 32 t?ng thì m?ng này ch? c?n l?u các m?c ranh gi?i nh?y t?ng r?t nh?
+    int path_nodes[32]; 
+    int current_depth = 0;
+    // ---------------------------------------------------------------------
+
+    int ind = 0;
+    
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+            
+            // T?n d?ng c? ch? nh?n di?n kho?ng cách t hi?n t?i ?? xén h?p s?m t? câu h?i tr??c c?a bác
+            th1 = hit_bbox4(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, tl1);
+            th2 = hit_bbox4(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+
+            if (tl1 >= t) th1 = -1.0f;
+            if (tl2 >= t) th2 = -1.0f;
+
+            bool left  = (tl1 <= th1) && (th1 > 0.0f);
+            bool right = (tl2 <= th2) && (th2 > 0.0f);
+
+            if (left && right)
+            {
+                // ?úng logic DFS: ??y con xa h?n vào Bit-Stack b?ng toán t? d?ch bit (Shift)
+                if (tl1 < tl2) 
+                { 
+                    // L?u d?u: ?ánh bit 1 t?i t?ng hi?n t?i ?? ?ánh d?u nhánh PH?I c?n quay l?i cày sau
+                    bit_stk |= (1u << uint(current_depth)); 
+                    path_nodes[current_depth] = rightIndex;
+                    
+                    current_depth++;
+                    ind = leftIndex; 
+                }
+                else 
+                { 
+                    // L?u d?u nhánh TRÁI c?n quay l?i cày sau
+                    bit_stk |= (1u << uint(current_depth)); 
+                    path_nodes[current_depth] = leftIndex;
+                    
+                    current_depth++;
+                    ind = rightIndex; 
+                }
+                continue;
+            }
+            else if (left)  
+            { 
+                current_depth++;
+                ind = leftIndex;  
+                continue; 
+            }
+            else if (right) 
+            { 
+                current_depth++;
+                ind = rightIndex; 
+                continue; 
+            }
+        }   
+        else 
+        {
+            // X? LÝ NÚT LÁ: Duy?t danh sách tam giác (Hàm MT chu?n t?i ?u nh?t c?a bác)
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = end - 1; i >= start; --i) 
+            { 
+                hit_triangle2(r, i, rec, t); 
+            }
+        }
+
+        // ============================================================
+        // L?NH POP B?NG TOÁN T? BIT SIÊU T?C (BIT-STACK BACKTRACKING)
+        // ============================================================
+        // L?nh findMSB() là hàm n?i trú ph?n c?ng c?a GPU, tìm ki?m bit 1 cao nh?t ch? trong 1 chu k?
+        int next_branch_depth = findMSB(bit_stk);
+
+        if (next_branch_depth != -1)
+        {
+            // L?y ID nút c?n duy?t ti?p t? m?ng v?t l?u tr?
+            ind = path_nodes[next_branch_depth];
+            
+            // Xóa bit 1 ?ã x? lý b?ng toán t? ??o bit AND NOT
+            bit_stk &= ~(1u << uint(next_branch_depth));
+            current_depth = next_branch_depth + 1;
+        }
+        else
+        {
+            // Bit-stack hoàn toàn tr?ng r?ng -> K?t thúc toàn b? ti?n trình duy?t cây
+            ind = -1;
+        }
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool hit_shadow_dfs(Ray r, float max_t)
+{
+    int stk[32];
+
+    int ptr = 0;
+    vec3 invdir = 1.0f / r.d;
+    //const bvec3 is_pos = greaterThanEqual(invdir, vec3(0.0));
+
+    //vec3 abs_dir = abs(r.d);
+    //int main_axis = (abs_dir.x > abs_dir.y) ? ((abs_dir.x > abs_dir.z) ? 0 : 2) : ((abs_dir.y > abs_dir.z) ? 1 : 2);
+    //bool choose_left = invdir[main_axis] >= 0.0f;
+
+    int ind = 0;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+
+            th1 = hit_bbox4(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz,  invdir, tl1);
+            th2 = hit_bbox4(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+
+            //th1 = hit_bbox42(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz,  invdir, is_pos, tl1);
+            //th2 = hit_bbox42(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, is_pos, tl2);
+            
+            bool left  = (tl1 <= th1) && (th1 > 0.0) && (tl1 < max_t);
+            bool right = (tl2 <= th2) && (th2 > 0.0) && (tl2 < max_t);
+            
+            if (left && right) 
+            { 
+                if (tl1 < tl2) { stk[ptr++] = rightIndex; ind = leftIndex; }
+                else { stk[ptr++] = leftIndex; ind = rightIndex; }
+                continue;
+
+                /*if(tl1 < tl2)
+                {
+                    stk[ptr++] = rightIndex; 
+                    ind = leftIndex;
+                    continue;
+                }*/
+
+                stk[ptr++] = leftIndex; 
+                ind = rightIndex;  
+                continue;
+            }
+            else if (left) { ind = leftIndex; continue; }
+            else if (right) { ind = rightIndex; continue; }
+        }
+        else 
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = end - 1; i >= start; --i) 
+            {
+                if (hitTriangleNoRec(r, i, max_t)) return true;
+            }
+        }   
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+    }
+    return false;
+}
+
+
+
+vec3 sample_light_position(int li)
+{
+    Light4 l = lights[li];
+    vec3 p = l.p.xyz;
+    vec3 u = l.u.xyz;
+    vec3 v = l.v.xyz;
+    float s = sqrt(rand());
+    float b0 = 1.0f - s;
+    float b1 = rand() * s;
+    return p + b0 * u + b1 * v;
+}
+
+vec3 path_trace(inout Ray r)
+{
+	vec3 L = vec3(0.0f);
+	vec3 T = vec3(1.0f);
+
+	float prev_pdf = 1.0f;
+
+
+	//Ray new_ray = r;
+	bool is_specular = true;
+
+	for(int i = 0; i < 3; ++i)
+	{
+        if (i >= 1)
+	    {
+	        // Max throughput component determines survival probability
+			float p = max(T.x, max(T.y, T.z));
+			
+			// Cap the survival probability to prevent infinite energy variance
+			//if (p > 0.95f) p = 0.95f; 
+            if (p > 0.6f) p = 0.6f; 
+
+			// Use your rand() function to evaluate Russian Roulette condition
+			if (rand() > p)
+			{
+		        break; // Terminate the ray path early
+			}
+
+			// Unbias the throughput vector with the survival probability
+			T /= p; 
+		}
+	    HitRecord rec;
+		
+        if(trace_bvh_dfs(r, rec))
+        //if(trace_bvh_dfs_bitstack(r, rec))
+        //if(trace_bvh_dfs_vectorized(r, rec))
+        {
+			float cos_incident = dot(r.d, rec.n);
+
+			vec3 original_n = rec.n;
+
+			if (cos_incident > 0)
+				rec.n = -rec.n;
+
+			vec4 emission = rec.emission;
+
+			if(emission.w != -1)
+			{
+				if(!is_specular)
+				{
+					vec3 light_direction = r.d * rec.t;
+
+					float length = length(light_direction);
+
+					light_direction = normalize(light_direction);
+
+					float cos_light = (-dot(light_direction, rec.n));//ko can abs
+
+					float length2 = length * length;
+
+					int light_index = int(emission.w);//int(vt.w);
+
+					
+					//Light4 l = lights[light_index];
+					//vec3 light_area_pdf = l.area_pdf.xyz;
+
+                    vec3 light_area_pdf = lights[light_index].area_pdf.xyz;
+					
+                    float pdf_light = length2 / (light_area_pdf.x * cos_light) * light_area_pdf.y;
+					float mis_weight = power_heuristic(prev_pdf, pdf_light);
+
+					
+					L += T * emission.xyz * mis_weight;
+
+					return L;
+				}
+                else
+				{
+					L += T * emission.xyz;
+					return L;
+				}
+			}
+
+			vec3 hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+
+            vec4 specular = rec.specular;
+
+			if(specular.w == 0)
+			{
+				int light_index = int(rand() * numLights);
+				
+				vec3 light_position = sample_light_position(light_index);
+
+				vec3 light_direction = light_position - hit_point;
+
+				float length = length(light_direction);
+
+				float ilength = 1.0f / length;
+
+				light_direction *= ilength;
+
+				float cos_mtl = dot(light_direction, original_n);
+
+				//float cos_light = dot(light_direction, rec.n);
+
+				Ray light_ray = Ray(hit_point, light_direction);
+
+                //Ray light_ray = Ray(light_position, -light_direction);
+
+				Light4 l = lights[light_index];
+
+				vec3 light_normal = l.n.xyz;
+				
+				float cos_light = ((dot(light_direction, light_normal)));
+
+                if(cos_mtl > 0.0f && cos_light < 0.0f && !hit_shadow_dfs(light_ray, length))		
+                {	
+					//Light4 l = lights[light_index];
+					
+					vec3 light_emission = l.e.xyz;
+					
+					vec3 light_area_pdf = l.area_pdf.xyz;
+					
+					float pdf_light = (length * length) / (light_area_pdf.x * -cos_light) * light_area_pdf.y;
+
+					vec3 bsdf_eval = diffuse_bsdf(r, rec, light_direction);
+
+					float bsdf_pdf = diffuse_pdf(r, rec, light_direction);
+
+                    //divide pdf_light
+					//float mis_weight = power_heuristic(pdf_light, bsdf_pdf);
+
+                    //normal no clamp
+					//L += T * light_emission * bsdf_eval * mis_weight / pdf_light;
+
+                    //already divide pdf_light
+                    float mis_weight = power_heuristic_divide(pdf_light, bsdf_pdf);
+
+                    L += T * light_emission * bsdf_eval * mis_weight;// / pdf_light;
+
+                    //vec3 incoming_L = T * light_emission * bsdf_eval * mis_weight / pdf_light;
+
+                    // Ng?n ch?n các tia n?y may m?n mang n?ng l??ng vô lý phá ho?i b?c tranh (Firefly)
+                    //float max_allowed_intensity = 5.0f; // B?n có th? tinh ch?nh t? 2.0f ??n 10.0f tùy ?? r?c c?a l?a
+                    //incoming_L = clamp(incoming_L, vec3(0.0f), vec3(max_allowed_intensity));
+
+                    //vec3 incoming_L = T * light_emission * bsdf_eval * mis_weight / pdf_light;
+
+                    // Ch? t?n 1 chu k? ph?n c?ng c?a GPU thay vì 6 chu k? nh? hàm clamp c?
+                    //incoming_L = min(incoming_L, vec3(10.0f)); 
+
+                    //L += incoming_L;
+					
+				}
+			}
+
+			//Sample for new ray
+			vec3 sample_direction = diffuse_sample(r, rec.n);
+			vec3 new_hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+
+			vec3 sample_eval = diffuse_bsdf(r, rec, sample_direction);
+
+			float bsdf_pdf = diffuse_pdf(r, rec, sample_direction);
+
+            //no russian roulette
+			T *= sample_eval;
+
+            float energy = max(T.x, max(T.y, T.z));
+            if (energy < 0.01f) 
+            {
+                break; 
+            }
+               
+
+			prev_pdf = bsdf_pdf;
+
+			is_specular = false;
+
+			r.o = new_hit_point;
+			r.d = sample_direction;
+
+			//r = Ray(new_hit_point, sample_direction);
+		}
+		else
+			return L;
+	}
+	return L;
+}
+
+struct PrecomputedRay {
+    vec3 o;
+    vec3 d;
+    // C?u trúc b? sung ?? di?t l?nh cross trong tam giác
+    int kx, ky;
+    float Sx, Sy, Sz;
+};
+
+bool hit_triangle_wald(PrecomputedRay pr, int i, inout HitRecord rec, inout float t)
+{
+    /*ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz;
+    vec3 v1 = vertices[triIndex.y].xyz;
+    vec3 v2 = vertices[triIndex.z].xyz;
+
+    // S? d?ng c?u trúc bi?n ??i ph?ng không r? nhánh, không dùng index ??ng ?? ??c vector
+    // Chuy?n bài toán v? h? t?a ?? 2D c?a tam giác
+    vec3 A = v0 - pr.o;
+    vec3 B = v1 - v0;
+    vec3 C = v2 - v0;
+
+    // Trích xu?t m??t mà b?ng swizzling ph?n c?ng (GPU ch?y c?c nhanh, ko b? ngh?n nh? [kx])
+    float Ax = (pr.kx == 0) ? A.x : ((pr.kx == 1) ? A.y : A.z);
+    float Ay = (pr.ky == 0) ? A.x : ((pr.ky == 1) ? A.y : A.z);
+    
+    float Bx = (pr.kx == 0) ? B.x : ((pr.kx == 1) ? B.y : B.z);
+    float By = (pr.ky == 0) ? B.x : ((pr.ky == 1) ? B.y : B.z);
+    
+    float Cx = (pr.kx == 0) ? C.x : ((pr.kx == 1) ? C.y : C.z);
+    float Cy = (pr.ky == 0) ? C.x : ((pr.ky == 1) ? C.y : C.z);
+
+    // Tính ??nh th?c ph?ng (2D Determinant) thay th? cho phép Cross 3D
+    float nu = Bx * Cy - By * Cx;
+    if (abs(nu) < 1e-6) return false;
+    float inv_nu = 1.0f / nu;
+
+    // Tính toán t?a ?? kho?ng cách tr?c ti?p d?c tr?c chính
+    float Az = (3 - pr.kx - pr.ky == 0) ? A.x : ((3 - pr.kx - pr.ky == 1) ? A.y : A.z);
+    float Bz = (3 - pr.kx - pr.ky == 0) ? B.x : ((3 - pr.kx - pr.ky == 1) ? B.y : B.z);
+    float Cz = (3 - pr.kx - pr.ky == 0) ? C.x : ((3 - pr.kx - pr.ky == 1) ? C.y : C.z);
+
+    float T_plane = Az * pr.Sz;
+    if (T_plane <= 0.0001f || T_plane >= t) return false;
+
+    // Tìm t?a ?? ph?ng sau khi t?nh ti?n tr??t
+    float Am_x = Ax - T_plane * pr.d[(pr.kx == 0) ? 0 : ((pr.kx == 1) ? 1 : 2)];
+    float Am_y = Ay - T_plane * pr.d[(pr.ky == 0) ? 0 : ((pr.ky == 1) ? 1 : 2)];
+
+    // Th? hàm C?nh 2D (Edge Tests) ?? tìm t?a ?? Barycentric chu?n
+    float u = (Am_x * Cy - Am_y * Cx) * inv_nu;
+    if (u < 0.0f || u > 1.0f) return false;
+
+    float v = (Bx * Am_y - By * Am_x) * inv_nu;
+    if (v < 0.0f || u + v > 1.0f) return false;
+
+    // Kh?p 100% v?i h? Barycentric c?a Möller-Trumbore -> S?a hoàn toàn l?i Texture
+    t = T_plane;
+    rec.u = u;
+    rec.v = v;
+    rec.triangle_ind = i;
+    rec.mtl_ind = triIndex.w;
+    return true;*/
+
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz;
+    vec3 v1 = vertices[triIndex.y].xyz;
+    vec3 v2 = vertices[triIndex.z].xyz;
+
+    // 1. T?nh ti?n g?c tam giác v? g?c tia
+    vec3 A = v0 - pr.o;
+    vec3 B = v1 - v0;
+    vec3 C = v2 - v0;
+
+    // 2. Chuy?n ??i sang không gian tr??t 2D b?ng h?ng s? ma tr?n pr.Sx/Sy/Sz
+    // Kh?c ph?c tri?t ?? l?i tính toán t?a ?? giao ?i?m ph?ng làm sinh Point Cloud
+    float Ax = A[pr.kx] - pr.Sx * A[3 - pr.kx - pr.ky];
+    float Ay = A[pr.ky] - pr.Sy * A[3 - pr.kx - pr.ky];
+    
+    float Bx = B[pr.kx] - pr.Sx * B[3 - pr.kx - pr.ky];
+    float By = B[pr.ky] - pr.Sy * B[3 - pr.kx - pr.ky];
+    
+    float Cx = C[pr.kx] - pr.Sx * C[3 - pr.kx - pr.ky];
+    float Cy = C[pr.ky] - pr.Sy * C[3 - pr.kx - pr.ky];
+
+    // 3. Tính toán ??nh th?c ph?ng 2D chính xác
+    float nu = Bx * Cy - By * Cx;
+    if (abs(nu) < 1e-6) return false;
+    float inv_nu = 1.0f / nu;
+
+    // 4. Tính toán kho?ng cách tHit chu?n d?c theo tr?c chính Dominant (kz)
+    // kz luôn b?ng (3 - kx - ky)
+    float T_plane = A[3 - pr.kx - pr.ky] * pr.Sz;
+    if (T_plane <= 0.0001f || T_plane >= t) return false;
+
+    // 5. Th? hàm C?nh 2D (Edge Tests) ?? tính t?a ?? Barycentric chu?n
+    // S?a l?i ??o ng??c d?u khi?n tia b? hi?u sai ranh gi?i Edge
+    float u = (Ax * Cy - Ay * Cx) * inv_nu;
+    if (u < 0.0f || u > 1.0f) return false;
+
+    float v = (Bx * Ay - By * Ax) * inv_nu;
+    if (v < 0.0f || u + v > 1.0f) return false;
+
+    // Trúng tam giác hoàn ch?nh -> Tr? d? li?u ??ng b? Möller-Trumbore
+    t = T_plane;
+    rec.u = u;
+    rec.v = v;
+    rec.triangle_ind = i;
+    rec.mtl_ind = triIndex.w;
+    return true;
+}
+
+bool hitTriangleNoRec_wald(PrecomputedRay pr, int i, float max_t)
+{
+    /*ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz;
+    vec3 v1 = vertices[triIndex.y].xyz;
+    vec3 v2 = vertices[triIndex.z].xyz;
+
+    // T?nh ti?n các ??nh t??ng ??i v?i g?c tia shadow
+    vec3 A = v0 - pr.o;
+    vec3 B = v1 - v0;
+    vec3 C = v2 - v0;
+
+    // Trích xu?t t?a ?? ph?ng b?ng Swizzling ph?n c?ng nhanh chóng
+    float Ax = (pr.kx == 0) ? A.x : ((pr.kx == 1) ? A.y : A.z);
+    float Ay = (pr.ky == 0) ? A.x : ((pr.ky == 1) ? A.y : A.z);
+    
+    float Bx = (pr.kx == 0) ? B.x : ((pr.kx == 1) ? B.y : B.z);
+    float By = (pr.ky == 0) ? B.x : ((pr.ky == 1) ? B.y : B.z);
+    
+    float Cx = (pr.kx == 0) ? C.x : ((pr.kx == 1) ? C.y : C.z);
+    float Cy = (pr.ky == 0) ? C.x : ((pr.ky == 1) ? C.y : C.z);
+
+    // Tính ??nh th?c ph?ng (2D Determinant) thay th? hoàn toàn phép Cross 3D
+    float nu = Bx * Cy - By * Cx;
+    if (abs(nu) < 1e-6) return false;
+    float inv_nu = 1.0f / nu;
+
+    // Trích xu?t t?a ?? d?c theo tr?c chính Dominant (kz) ?? tính tHit
+    float Az = (3 - pr.kx - pr.ky == 0) ? A.x : ((3 - pr.kx - pr.ky == 1) ? A.y : A.z);
+
+    // Tính kho?ng cách giao c?t tr?c ti?p d?c tr?c chính
+    float T_plane = Az * pr.Sz;
+    if (T_plane <= 0.0001f || T_plane >= max_t) return false;
+
+    // Tìm t?a ?? giao ?i?m ph?ng sau khi th?c hi?n phép tr??t (Sheared coordinate)
+    float dx = (pr.kx == 0) ? pr.d.x : ((pr.kx == 1) ? pr.d.y : pr.d.z);
+    float dy = (pr.ky == 0) ? pr.d.x : ((pr.ky == 1) ? pr.d.y : pr.d.z);
+    float Am_x = Ax - T_plane * dx;
+    float Am_y = Ay - T_plane * dy;
+
+    // Th? hàm C?nh 2D (Edge Tests) ?? ki?m tra ranh gi?i tam giác ph?ng
+    float u = (Am_x * Cy - Am_y * Cx) * inv_nu;
+    if (u < 0.0f || u > 1.0f) return false;
+
+    float v = (Bx * Am_y - By * Am_x) * inv_nu;
+    if (v < 0.0f || u + v > 1.0f) return false;
+
+    return true; // Trúng b?t k? v?t c?n nào, xác nh?n b? bóng râm ngay*/
+
+    ivec4 triIndex = triangles[3 * i];
+    vec3 v0 = vertices[triIndex.x].xyz;
+    vec3 v1 = vertices[triIndex.y].xyz;
+    vec3 v2 = vertices[triIndex.z].xyz;
+
+    vec3 A = v0 - pr.o;
+    vec3 B = v1 - v0;
+    vec3 C = v2 - v0;
+
+    int kz = 3 - pr.kx - pr.ky;
+
+    float Ax = A[pr.kx] - pr.Sx * A[kz];
+    float Ay = A[pr.ky] - pr.Sy * A[kz];
+    
+    float Bx = B[pr.kx] - pr.Sx * B[kz];
+    float By = B[pr.ky] - pr.Sy * B[kz];
+    
+    float Cx = C[pr.kx] - pr.Sx * C[kz];
+    float Cy = C[pr.ky] - pr.Sy * C[kz];
+
+    float nu = Bx * Cy - By * Cx;
+    if (abs(nu) < 1e-6) return false;
+    float inv_nu = 1.0f / nu;
+
+    float T_plane = A[kz] * pr.Sz;
+    if (T_plane <= 0.0001f || T_plane >= max_t) return false;
+
+    float u = (Ax * Cy - Ay * Cx) * inv_nu;
+    if (u < 0.0f || u > 1.0f) return false;
+
+    float v = (Bx * Ay - By * Ax) * inv_nu;
+    if (v < 0.0f || u + v > 1.0f) return false;
+
+    return true;
+}
+
+bool trace_bvh_dfs_wald(Ray r, out HitRecord rec)
+{
+    int stk[32]; 
+    int ptr = 0;
+    float t = inf;
+    const vec3 invdir = 1.0f / (r.d);
+
+    // --- KH?I TÍNH TOÁN TR??C H??NG TIA VÀ TR?C CHÍNH (PRECOMPUTED RAY) ---
+    vec3 abs_d = abs(r.d);
+    int kz = (abs_d.x > abs_d.y) ? ((abs_d.x > abs_d.z) ? 0 : 2) : ((abs_d.y > abs_d.z) ? 1 : 2);
+    int kx = (kz + 1 == 3) ? 0 : kz + 1;
+    int ky = (kx + 1 == 3) ? 0 : kx + 1;
+
+    PrecomputedRay pr;
+    pr.o = r.o;
+    pr.d = r.d;
+    pr.kx = kx;
+    pr.ky = ky;
+    pr.Sz = 1.0f / r.d[kz];
+    pr.Sx = r.d[kx] * pr.Sz; // S?n sàng n?u c?n m? r?ng
+    pr.Sy = r.d[ky] * pr.Sz;
+    // ----------------------------------------------------------------------
+   
+    int ind = 0;
+    
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+            
+            th1 = hit_bbox4(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz, invdir, tl1);
+            th2 = hit_bbox4(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+
+            bool left  = (tl1 <= th1) && (th1 > 0.0f) && (tl1 < t);
+            bool right = (tl2 <= th2) && (th2 > 0.0f) && (tl2 < t);
+
+            if (left && right)
+            {
+                if (tl1 < tl2) { stk[ptr++] = rightIndex; ind = leftIndex; }
+                else { stk[ptr++] = leftIndex; ind = rightIndex; }
+                continue;
+            }
+            else if (left)  { ind = leftIndex;  continue; }
+            else if (right) { ind = rightIndex; continue; }
+        }   
+        else 
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = end - 1; i >= start; --i) 
+            { 
+                // G?i hàm Wald siêu t?c truy?n pr vào thay vì r
+                hit_triangle_wald(pr, i, rec, t); 
+            }
+        }
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+    }
+    
+    if (t < inf)
+    {
+        rec.t = t;
+        compute_normal_texcoord_and_material(rec);
+        return true;
+    }
+    return false;
+}
+
+bool hit_shadow_dfs_wald(Ray r, float max_t)
+{
+    int stk[32];
+    int ptr = 0;
+    vec3 invdir = 1.0f / r.d;
+
+    // --- KH?I TÍNH TOÁN TR??C H??NG TIA VÀ TR?C CHÍNH (PRECOMPUTED RAY) ---
+    vec3 abs_d = abs(r.d);
+    int kz = (abs_d.x > abs_d.y) ? ((abs_d.x > abs_d.z) ? 0 : 2) : ((abs_d.y > abs_d.z) ? 1 : 2);
+    int kx = (kz + 1 == 3) ? 0 : kz + 1;
+    int ky = (kx + 1 == 3) ? 0 : kx + 1;
+
+    PrecomputedRay pr;
+    pr.o = r.o;
+    pr.d = r.d;
+    pr.kx = kx;
+    pr.ky = ky;
+    pr.Sz = 1.0f / r.d[kz];
+    pr.Sx = r.d[kx] * pr.Sz;
+    pr.Sy = r.d[ky] * pr.Sz;
+    // ----------------------------------------------------------------------
+
+    int ind = 0;
+
+    while (ind != -1)
+    {
+        int n = ind << 1; 
+        vec4 bmin = bvh[n];
+        vec4 bmax = bvh[n + 1];
+        int range = int(bmax.w);
+
+        if (range == 0) 
+        {
+            int leftIndex  = ind + 1; 
+            int rightIndex = int(bmin.w); 
+            float tl1, th1, tl2, th2;
+            
+            // Hàm hit_bbox4 v?n nh?n Ray r thô nguyên b?n c?a b?n ?? ki?m tra h?p AABB
+            th1 = hit_bbox4(r, bvh[leftIndex * 2].xyz,  bvh[leftIndex * 2 + 1].xyz,  invdir, tl1);
+            th2 = hit_bbox4(r, bvh[rightIndex * 2].xyz, bvh[rightIndex * 2 + 1].xyz, invdir, tl2);
+            
+            bool left  = (tl1 <= th1) && (th1 > 0.0) && (tl1 < max_t);
+            bool right = (tl2 <= th2) && (th2 > 0.0) && (tl2 < max_t);
+            
+            if (left && right) 
+            { 
+                if (tl1 < tl2) { stk[ptr++] = rightIndex; ind = leftIndex; }
+                else { stk[ptr++] = leftIndex; ind = rightIndex; }
+                continue;
+            }
+            else if (left)  { ind = leftIndex;  continue; }
+            else if (right) { ind = rightIndex; continue; }
+        }
+        else 
+        {
+            int start = int(bmin.w);
+            int end   = start + range;
+            for (int i = end - 1; i >= start; --i) 
+            {
+                // G?i hàm ki?m tra tam giác bóng ph?ng Wald truy?n pr vào siêu t?c
+                if (hitTriangleNoRec_wald(pr, i, max_t)) return true;
+            }
+        }   
+        ind = (ptr > 0) ? stk[--ptr] : -1;
+    }
+    return false;
+}
+
+vec3 path_trace_wald(inout Ray r)
+{
+	vec3 L = vec3(0.0f);
+	vec3 T = vec3(1.0f);
+
+	float prev_pdf = 1.0f;
+	bool is_specular = true;
+
+	for(int i = 0; i < 3; ++i)
+	{
+		if (i >= 1)
+		{
+			// Xác su?t s?ng sót d?a trên thành ph?n n?ng l??ng l?n nh?t
+			float p = max(T.x, max(T.y, T.z));
+			
+			// Gi?i h?n RR (Capped Russian Roulette) ?? ki?m soát bi?n ??ng n?ng l??ng
+			if (p > 0.6f) p = 0.6f; 
+
+			if (rand() > p)
+			{
+				break; // Ch?m d?t ???ng ?i c?a tia s?m
+			}
+
+			// Nhân bù n?ng l??ng cho tia s?ng sót
+			T /= p; 
+		}
+
+		HitRecord rec;
+		
+		if(trace_bvh_dfs_wald(r, rec))
+		{
+        //return rec.n;
+			float cos_incident = dot(r.d, rec.n);
+			vec3 original_n = rec.n;
+
+			if (cos_incident > 0)
+				rec.n = -rec.n;
+
+			vec4 emission = rec.emission;
+
+			// --- X? LÝ NGU?N PHÁT SÁNG TRÚNG TIA GIÁN TI?P ---
+			if(emission.w != -1)
+			{
+				if(!is_specular)
+				{
+					vec3 light_direction = r.d * rec.t;
+					float length2 = dot(light_direction, light_direction); // T?i ?u: Dùng dot thay vì length * length ?? gi?m chu k? tính toán
+					
+					light_direction = normalize(light_direction);
+					float cos_light = -dot(light_direction, rec.n);
+
+					int light_index = int(emission.w);
+					Light4 l = lights[light_index];
+					vec3 light_area_pdf = l.area_pdf.xyz;
+					
+					float pdf_light = length2 / (light_area_pdf.x * cos_light) * light_area_pdf.y;
+					float mis_weight = power_heuristic(prev_pdf, pdf_light);
+					
+					L += T * emission.xyz * mis_weight;
+					return L;
+				}
+				else
+				{
+					L += T * emission.xyz;
+					return L;
+				}
+			}
+
+			vec3 hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+			vec4 specular = rec.specular;
+
+			// --- X? LÝ L?Y M?U ÁNH SÁNG TR?C TI?P (NEE) ---
+			if(specular.w == 0)
+			{
+				int light_index = int(rand() * numLights);
+				vec3 light_position = sample_light_position(light_index);
+				vec3 light_direction = light_position - hit_point;
+
+				float length = length(light_direction);
+				light_direction /= length; // T?i ?u hóa phép chu?n hóa vector (Tri?t tiêu 1 l?nh toán h?c)
+
+				float cos_mtl = dot(light_direction, original_n);
+
+				Light4 l = lights[light_index];
+				vec3 light_normal = l.n.xyz;
+				float cos_light = dot(light_direction, light_normal);
+
+				// Ch? b?n tia shadow khi các góc hình h?c h?p lý
+				if(cos_mtl > 0.0f && cos_light < 0.0f)
+				{
+					Ray light_ray = Ray(hit_point, light_direction);
+
+					if (!hit_shadow_dfs_wald(light_ray, length))		
+					{	
+						vec3 light_emission = l.e.xyz;
+						vec3 light_area_pdf = l.area_pdf.xyz;
+						
+						float pdf_light = (length * length) / (light_area_pdf.x * -cos_light) * light_area_pdf.y;
+						vec3 bsdf_eval = diffuse_bsdf(r, rec, light_direction);
+						float bsdf_pdf = diffuse_pdf(r, rec, light_direction);
+
+						float mis_weight = power_heuristic(pdf_light, bsdf_pdf);
+
+						// Hàm tr? v? n?ng l??ng thô t? nhiên, không r? nhánh min/clamp ?? l?y l?i 11.7 FPS
+						L += T * light_emission * bsdf_eval * mis_weight / pdf_light;
+					}
+				}
+			}
+
+			// --- SINH TIA M?I CHO B??C N?Y GIÁN TI?P TI?P THEO ---
+			vec3 sample_direction = diffuse_sample(r, rec.n);
+			vec3 new_hit_point = r.o + r.d * rec.t + rec.n * 0.0002f;
+
+			vec3 sample_eval = diffuse_bsdf(r, rec, sample_direction);
+			float bsdf_pdf = diffuse_pdf(r, rec, sample_direction);
+
+			T *= sample_eval;
+
+			// Ki?m tra n?ng l??ng t?i thi?u ?? c?t t?a tia y?u s?m
+			float energy = max(T.x, max(T.y, T.z));
+			if (energy < 0.01f) 
+			{
+				break; 
+			}
+
+			prev_pdf = bsdf_pdf;
+			is_specular = false;
+
+			r.o = new_hit_point;
+			r.d = sample_direction;
+		}
+		else
+		{
+			return L;
+		}
+	}
+	return L;
+}
+
+void main_bad()
+{
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoords.x >= int(screenResolution.x) || pixelCoords.y >= int(screenResolution.y))  
+        return;   
+
+    // ??c d? li?u phân tích t? frame tr??c
+    vec4 history_data = imageLoad(variance_history_tex, pixelCoords);
+    float history_mean_lum = history_data.r; // ?? sáng trung bình l?ch s?
+    float history_m2 = history_data.a;
+
+    vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+    vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+
+    // ============================================================
+    // ?ÁNH CH?N VÙNG SÁNG: N?U LÀ VÙNG SÁNG M?NH -> KHÔNG TÍNH TOÁN N?A
+    // Gán th?ng giá tr? c? (không ??i) ?? di?t l?i xám màu và thoát luôn
+    // ============================================================
+    if (history_mean_lum > 1.5f && currentFrameSample > MIN_SAMPLES)
+    //if (accumulate_color.x > 1.5f && currentFrameSample > MIN_SAMPLES)
+    {
+        // Gi? nguyên n?ng l??ng ngu?n sáng r?c r?, t?ng ti?n ??ng ??u theo frame
+        // Do history_mean_lum chính là luminance l?ch s? c?a ng?n l?a, gán th?ng vec3(history_mean_lum) là chu?n màu phát x? c?
+        imageStore(img_output, pixelCoords, vec4(vec3(history_mean_lum) + accumulate_color, 1.0f));
+        //imageStore(img_output, pixelCoords, vec4(vec3(history_mean_lum), 1.0f));
+
+        //imageStore(img_output, pixelCoords, vec4(accumulate_color, 1.0f));
+        return; 
+    }
+
+    // ============================================================
+    // CÁC PIXEL KHÁC: XÉT ?I?U KI?N H?I T? T? NHIÊN THEO C?M 8x8
+    // ============================================================
+    if (gl_LocalInvocationIndex == 0)
+        shared_workgroup_active = false;
+
+    float current_variance = 0.0f;
+    if (currentFrameSample > MIN_SAMPLES)
+        current_variance = history_m2 / float(currentFrameSample - 1);
+    else
+        current_variance = 1.0f;
+
+    if (current_variance > VARIANCE_THRESHOLD)
+        shared_workgroup_active = true;
+
+    // ??ng b? hóa tr?ng thái b? nh? Shared c?a c?m 8x8
+    memoryBarrierShared();
+    barrier();
+
+    // Ch? khi nào C? C?M ??t ?i?u ki?n h?i t? thì m?i ???c ng?t tia
+    if (!shared_workgroup_active)
+    {
+        return; 
+    }
+
+    // --- TI?N TRÌNH PATH TRACING CHO PIXEL TH??NG (Ch? ch?y khi ch?a h?i t?) ---
+    float jitter_offset_x = (currentFrameSample % 2 == 0) ? 0.25f : -0.25f;
+    float jitter_offset_y = ((currentFrameSample / 2) % 2 == 0) ? 0.25f : -0.25f;
+    vec2 jittered_uv = (vec2(pixelCoords) + vec2(0.5f) + vec2(jitter_offset_x, jitter_offset_y)) / screenResolution;
+    seed = jittered_uv;
+
+    float r1 = 2.0f * rand();
+    float r2 = 2.0f * rand();
+
+    vec2 jitter;
+    jitter.x = r1 < 1.0 ? sqrt(r1) - 1.0f : 1.0f - sqrt(2.0f - r1);
+    jitter.y = r2 < 1.0 ? sqrt(r2) - 1.0f : 1.0f - sqrt(2.0f - r2);
+    jitter /= (screenResolution * 0.5f);
+
+    vec2 d = (2.0f * texCoords - 1.0f) + jitter;
+
+    float tan_fov = tan(camera.fov * 0.5f);
+    d.x *= screenResolution.x / screenResolution.y * tan_fov;
+    d.y *= tan_fov;
+
+    vec3 rayDir = normalize(d.x * camera.right + d.y * camera.up + camera.forward);
+    Ray ray = Ray(camera.position, rayDir);
+
+    vec3 pixelColor = path_trace(ray);
+
+    imageStore(img_output, pixelCoords, vec4(pixelColor + accumulate_color, 1.0f));
+
+    // --- C?P NH?T WELFORD TÍNH VARIANCE CHO FRAME TI?P THEO ---
+    float new_luminance = dot(pixelColor, vec3(0.2126, 0.7152, 0.0722));
+        
+    float old_mean = history_data.r;
+    float old_m2 = history_data.a;
+        
+    float current_sample_weight = 1.0f / float(currentFrameSample + 1);
+    float new_mean = mix(old_mean, new_luminance, current_sample_weight);
+        
+    float delta0 = new_luminance - old_mean;
+    float delta1 = new_luminance - new_mean;
+    float new_m2 = old_m2 + delta0 * delta1;
+
+    imageStore(variance_history_tex, pixelCoords, vec4(new_mean, 0.0f, 0.0f, new_m2));
+}
+
+//best
+void main()
+{
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoords.x >= int(screenResolution.x) || pixelCoords.y >= int(screenResolution.y))  
+        return;   
+
+    if (gl_LocalInvocationIndex == 0)
+        shared_workgroup_active = false;
+
+    float current_variance = 0.0f;
+    float current_luminance = 0.0f;
+    vec4 history_data = vec4(0.0f);
+
+    history_data = imageLoad(variance_history_tex, pixelCoords);
+    float history_mean_lum = history_data.r;//light source, whiout this, light will get weaker and grayer
+    float history_m2 = history_data.a;
+
+    if(currentFrameSample > MIN_SAMPLES)
+        current_variance = history_m2 / float(currentFrameSample - 1);
+    else
+        current_variance = 1.0f;
+
+    if (history_mean_lum > 1.5f) 
+    {
+        current_variance = 1.0f; // B?t bu?c cày ti?p, không cho phép skip s?m
+    }
+
+    if(current_variance > VARIANCE_THRESHOLD)
+        shared_workgroup_active = true;
+
+   // ??ng b? hóa tr?ng thái b? nh? Shared sau khi toàn b? lu?ng ?ã b? phi?u
+    memoryBarrierShared();
+    barrier();
+
+    // ============================================================
+    // B?Y WARP DIVERGENCE ???C GI?I QUY?T ? ?ÂY
+    // N?u c? c?m 8x8 ??u có variance < threshold, shared_workgroup_active s? gi? nguyên là false.
+    // Toàn b? 64 lu?ng (Warp) cùng thoát ??ng th?i, tri?t tiêu lãng phí chu k? c?a GPU!
+    // ============================================================
+    if (!shared_workgroup_active)
+    {
+        return; 
+    }
+
+    vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+	
+    // T?o Jitter TAA theo khung hình gi?ng b?n main_final c?a b?n
+    float jitter_offset_x = (currentFrameSample % 2 == 0) ? 0.25f : -0.25f;
+    float jitter_offset_y = ((currentFrameSample / 2) % 2 == 0) ? 0.25f : -0.25f;
+    vec2 jittered_uv = (vec2(pixelCoords) + vec2(0.5f) + vec2(jitter_offset_x, jitter_offset_y)) / screenResolution;
+    seed = jittered_uv;
+
+    //normal
+	float r1 = 2.0f * rand();
+	float r2 = 2.0f * rand();
+
+	vec2 jitter;
+
+	jitter.x = r1 < 1.0 ? sqrt(r1) - 1.0f : 1.0f - sqrt(2.0f - r1);
+	jitter.y = r2 < 1.0 ? sqrt(r2) - 1.0f : 1.0f - sqrt(2.0f - r2);
+	jitter /= (screenResolution * 0.5f);
+
+	vec2 d = (2.0f * texCoords - 1.0f) + jitter;
+
+	float tan_fov = tan(camera.fov * 0.5f);
+	d.x *= screenResolution.x / screenResolution.y * tan_fov;
+	d.y *= tan_fov;
+
+	vec3 rayDir = normalize(d.x * camera.right + d.y * camera.up + camera.forward);
+
+	Ray ray = Ray(camera.position, rayDir);
+
+	vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+    
+    vec3 pixelColor = path_trace(ray);
+
+    //fail
+    //vec3 pixelColor = path_trace_wald(ray);
+
+    vec3 final_color = pixelColor + accumulate_color;
+
+    imageStore(img_output, pixelCoords, vec4(pixelColor + accumulate_color, 1.0f));
+
+
+    // ============================================================
+    // THU?T TOÁN WELFORD TÍNH VARIANCE ONLINE (CHUY?N HÓA SANG GLSL)
+    // ============================================================
+    // Trích xu?t s?c ?? (Luminance) c?a m?u màu hi?n t?i
+    float new_luminance = dot(pixelColor, vec3(0.2126, 0.7152, 0.0722));
+        
+    float old_mean = history_data.r;
+    float old_m2 = history_data.a;
+        
+    // 1. C?p nh?t giá tr? trung bình ch?y l?y ti?n (Running Mean)
+    float current_sample_weight = 1.0f / float(currentFrameSample + 1);
+    float new_mean = mix(old_mean, new_luminance, current_sample_weight);
+        
+    // 2. Tính toán t?ng bình ph??ng kho?ng cách sai s? l?y ti?n (Running M2)
+    float delta0 = new_luminance - old_mean;
+    float delta1 = new_luminance - new_mean;
+    float new_m2 = old_m2 + delta0 * delta1;
+
+    // L?u ng??c l?i Texture phân tích ?? chu?n b? cho khung hình ti?p theo
+    imageStore(variance_history_tex, pixelCoords, vec4(new_mean, 0.0f, 0.0f, new_m2));
+}
+
+/*void main_variance2()
+{
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    bool inside_screen = (pixelCoords.x < int(screenResolution.x) && pixelCoords.y < int(screenResolution.y));
+
+    if (gl_LocalInvocationIndex == 0) {
+        shared_workgroup_active = false;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    float current_variance = 0.0f;
+    vec4 history_data = vec4(0.0f);
+    bool is_pure_light_source = false;
+
+    if (inside_screen)
+    {
+        history_data = imageLoad(variance_history_tex, pixelCoords);
+        float history_mean_lum = history_data.r;
+        float history_m2 = history_data.a;
+
+        // ------------------------------------------------======================
+        // ?ÁNH CH?N NGU?N SÁNG: N?u pixel có ?? sáng l?ch s? c?c l?n (Vùng L?a/?èn)
+        // Chúng ta b?t c? ?ánh d?u ?? gán c?ng giá tr? màu, b? qua hoàn toàn vi?c dò tia
+        // ------------------------------------------------======================
+        if (history_mean_lum > 2.0f && currentFrameSample > MIN_SAMPLES)
+        {
+            is_pure_light_source = true;
+        }
+        else
+        {
+            if (currentFrameSample > MIN_SAMPLES) {
+                current_variance = history_m2 / float(currentFrameSample - 1);
+            } else {
+                current_variance = 1.0f; 
+            }
+
+            if (current_variance > VARIANCE_THRESHOLD) {
+                shared_workgroup_active = true;
+            }
+        }
+    }
+
+    memoryBarrierShared();
+    barrier();
+
+    // N?u c? c?m 8x8 ??u h?i t? HO?C là ngu?n sáng c? ??nh, toàn c?m thoát s?m!
+    if (!shared_workgroup_active && is_pure_light_source)
+    {
+        if (inside_screen)
+        {
+            // L?y màu n?n tích l?y hi?n t?i
+            vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+            vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+
+            // Tính toán giá tr? gán c? ??nh l?y ti?n d?a trên ?? sáng l?ch s? c?a chính ng?n l?a
+            // ?i?u này giúp pixel t?ng ti?n n?ng l??ng ??ng b?, không b? xám ?i, không b? l?ch màu
+            vec3 pure_light_color = history_data.rgb; // S? d?ng giá tr? màu trung bình l?ch s? ?ã ghi nh?n
+            if (length(pure_light_color) < 0.01f) pure_light_color = vec3(10.0f, 5.0f, 1.0f); // Fallback màu l?a thô n?u tr?ng
+
+            // C?ng d?n t?nh ti?n liên t?c m??t mà gi?ng nh? tia th?t v?a b?n trúng ngu?n sáng
+            imageStore(img_output, pixelCoords, vec4(pure_light_color + accumulate_color, 1.0f));
+        }
+        return; 
+    }
+
+    // --- ?O?N CODE DUY?T TIA PATH TRACING BÌNH TH??NG ? D??I GI? NGUYÊN ---
+    if (inside_screen)
+    {
+        // ... Logic t?o tia Ray, g?i path_trace(ray) ...
+        // ... Cu?i hàm, khi ghi d? li?u Welford, nh? c?t c? màu RGB vào history_data ?? dùng ? frame sau:
+        
+        // C?p nh?t Welford RGB Mean thay vì ch? l?u ??n kênh s?c ??:
+        vec3 old_mean_rgb = history_data.rgb;
+        float current_sample_weight = 1.0f / float(currentFrameSample + 1);
+        vec3 new_mean_rgb = mix(old_mean_rgb, pixelColor, current_sample_weight); // pixelColor là k?t qu? c?a path_trace
+        
+        float new_luminance = dot(pixelColor, vec3(0.2126, 0.7152, 0.0722));
+        float old_mean_lum = dot(old_mean_rgb, vec3(0.2126, 0.7152, 0.0722));
+        float new_mean_lum = dot(new_mean_rgb, vec3(0.2126, 0.7152, 0.0722));
+        
+        float delta0 = new_luminance - old_mean_lum;
+        float delta1 = new_luminance - new_mean_lum;
+        float new_m2 = history_data.a + delta0 * delta1;
+
+        // Ghi ?è b? ??m l?ch s? ??y ?? c? RGB ?? frame sau gán c?ng khi c?n
+        imageStore(variance_history_tex, pixelCoords, vec4(new_mean_rgb, new_m2));
+    }
+}*/
+
+void mainb()
+{
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoords.x >= int(screenResolution.x) || pixelCoords.y >= int(screenResolution.y))  
+        return;   
+
+    if (gl_LocalInvocationIndex == 0)
+        shared_workgroup_active = false;
+
+    float current_variance = 0.0f;
+    vec4 history_data = imageLoad(variance_history_tex, pixelCoords);
+    float history_mean_lum = history_data.r; // ?? sáng trung bình l?ch s?
+    float history_m2 = history_data.a;
+
+    // Ki?m tra xem pixel này có thu?c vùng ngu?n sáng m?nh c? ??nh không
+    bool is_light_source = (history_mean_lum > 1.5f && currentFrameSample > MIN_SAMPLES);
+
+    // N?u KHÔNG PH?I là ngu?n sáng, ta m?i tính toán Variance bình th??ng ?? xét h?i t?
+    if (!is_light_source)
+    {
+        if (currentFrameSample > MIN_SAMPLES)
+            current_variance = history_m2 / float(currentFrameSample - 1);
+        else
+            current_variance = 1.0f;
+
+        if (current_variance > VARIANCE_THRESHOLD)
+            shared_workgroup_active = true;
+    }
+
+    // ??ng b? hóa tr?ng thái nhóm sau khi các pixel không ph?i ngu?n sáng b? phi?u
+    memoryBarrierShared();
+    barrier();
+
+    // ============================================================
+    // X? LÝ ?ÁNH CH?N NGU?N SÁNG & B?Y DIVERGENCE 
+    // ============================================================
+    if (!shared_workgroup_active)
+    {
+        // N?u c? c?m 8x8 ?ã h?i t? HO?C ô này ch? ch?a toàn ngu?n sáng c? ??nh:
+        if (is_light_source)
+        {
+            // Thay vì trace ti?p, ta n?p giá tr? c? ??nh l?y ti?n tr?c ti?p ?? di?t l?i xám màu
+            vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+            vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+            
+            // Gi? cho n?ng l??ng vùng sáng t?ng tr??ng tuy?n tính chính xác theo giá tr? l?ch s? c?a nó
+            // (B?n có th? nhân history_mean_lum v?i màu s?c thô c?a l?a n?u mu?n, 
+            // nh?ng c?ng tr?c ti?p history_mean_lum là gi?i pháp gi? màu chu?n nh?t)
+            vec3 constant_light_energy = vec3(history_mean_lum); 
+            
+            imageStore(img_output, pixelCoords, vec4(constant_light_energy + accumulate_color, 1.0f));
+        }
+        return; // Thoát s?m ??ng b? cho toàn b? c?m 8x8, gi?i phóng 100% tài nguyên!
+    }
+
+    // --- TI?N TRÌNH PATH TRACING G?C (Ch? ch?y khi c?m ch?a h?i t? và pixel không ph?i ngu?n sáng) ---
+    vec2 texCoords = (vec2(pixelCoords) + vec2(0.5f)) / screenResolution;
+	
+    float jitter_offset_x = (currentFrameSample % 2 == 0) ? 0.25f : -0.25f;
+    float jitter_offset_y = ((currentFrameSample / 2) % 2 == 0) ? 0.25f : -0.25f;
+    vec2 jittered_uv = (vec2(pixelCoords) + vec2(0.5f) + vec2(jitter_offset_x, jitter_offset_y)) / screenResolution;
+    seed = jittered_uv;
+
+    float r1 = 2.0f * rand();
+    float r2 = 2.0f * rand();
+
+    vec2 jitter;
+    jitter.x = r1 < 1.0 ? sqrt(r1) - 1.0f : 1.0f - sqrt(2.0f - r1);
+    jitter.y = r2 < 1.0 ? sqrt(r2) - 1.0f : 1.0f - sqrt(2.0f - r2);
+    jitter /= (screenResolution * 0.5f);
+
+    vec2 d = (2.0f * texCoords - 1.0f) + jitter;
+
+    float tan_fov = tan(camera.fov * 0.5f);
+    d.x *= screenResolution.x / screenResolution.y * tan_fov;
+    d.y *= tan_fov;
+
+    vec3 rayDir = normalize(d.x * camera.right + d.y * camera.up + camera.forward);
+    Ray ray = Ray(camera.position, rayDir);
+
+    vec3 accumulate_color = texture(accumulate_tex, texCoords).xyz;
+    
+    // N?u pixel hi?n t?i là ngu?n sáng, ta gán luôn giá tr? thô, ng??c l?i m?i tính toán tia n?ng
+    vec3 pixelColor = is_light_source ? vec3(history_mean_lum) : path_trace(ray);
+
+    imageStore(img_output, pixelCoords, vec4(pixelColor + accumulate_color, 1.0f));
+
+    // ============================================================
+    // THU?T TOÁN WELFORD TÍNH VARIANCE ONLINE
+    // ============================================================
+    float new_luminance = dot(pixelColor, vec3(0.2126, 0.7152, 0.0722));
+        
+    float old_mean = history_data.r;
+    float old_m2 = history_data.a;
+        
+    float current_sample_weight = 1.0f / float(currentFrameSample + 1);
+    float new_mean = mix(old_mean, new_luminance, current_sample_weight);
+        
+    float delta0 = new_luminance - old_mean;
+    float delta1 = new_luminance - new_mean;
+    float new_m2 = old_m2 + delta0 * delta1;
+
+    imageStore(variance_history_tex, pixelCoords, vec4(new_mean, 0.0f, 0.0f, new_m2));
+}
